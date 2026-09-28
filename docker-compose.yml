@@ -3,7 +3,7 @@ services:
     image: pgvector/pgvector:pg16
     environment:
       POSTGRES_PASSWORD: dev
-      POSTGRES_DB: loginsights
+      POSTGRES_DB: triagerag
     ports: ["5433:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
 

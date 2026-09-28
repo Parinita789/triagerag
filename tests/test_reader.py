@@ -1,5 +1,5 @@
 import pytest
-from loginsights.ingest.reader import parse_line, BLOCK_RE
+from triagerag.index.logs.reader import parse_line, BLOCK_RE
 
 def test_standard_line():
     raw = ("081109 203518 143 INFO dfs.DataNode$DataXceiver: "

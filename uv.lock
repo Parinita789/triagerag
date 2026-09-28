@@ -58,7 +58,7 @@ wheels = [
 ]
 
 [[package]]
-name = "loginsights"
+name = "triagerag"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

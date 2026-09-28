@@ -1,5 +1,5 @@
 def main():
-    print("Hello from loginsights!")
+    print("Hello from triagerag!")
 
 
 if __name__ == "__main__":
