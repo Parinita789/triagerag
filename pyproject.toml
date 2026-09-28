@@ -1,0 +1,32 @@
+[project]
+name = "loginsights"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "drain3", "psycopg[binary]", "pydantic",
+    "pydantic-settings", "python-dotenv",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/loginsights"]
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+strict = true
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]

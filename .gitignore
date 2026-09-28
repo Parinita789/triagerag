@@ -1,0 +1,14 @@
+/data
+.env
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Virtualenv
+.venv/
+
+# Tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
