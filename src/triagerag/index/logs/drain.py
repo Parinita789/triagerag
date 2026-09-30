@@ -7,7 +7,7 @@ from drain3.masking import MaskingInstruction
 
 _IP = r"\d+\.\d+\.\d+\.\d+(?::\d+)?"
 
-DEFAULT_STATE_PATH = Path(__file__).resolve().parents[4] / "data" / "drain_state.bin"
+DEFAULT_STATE_PATH = Path(__file__).resolve().parents[4] / "models" / "drain_state.bin"
 
 
 def build_miner(state_path: Path | None = None) -> TemplateMiner:

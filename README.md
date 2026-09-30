@@ -1,49 +1,41 @@
 # triagerag
 
-A RAG triage pipeline for distributed-system failures. When a new Jira ticket arrives, it normalizes any logs and stack traces in the ticket, retrieves related past tickets, and posts an LLM-generated diagnosis that cites its sources, or says it doesn't have enough evidence.
+An agentic RAG triage pipeline for distributed-system failures. When a new Jira ticket arrives, an LLM agent gathers evidence with tools: it queries logs in Loki, turns them into template statistics, and searches past tickets. Then it posts a diagnosis that cites its sources, or says it doesn't have enough evidence. No human is in the loop.
 
-Built on real data: 13,302 resolved Apache HDFS Jira tickets as the knowledge base, and 11M lines of HDFS production logs for log-template vocabulary.
+Built on real data: 13,302 resolved Apache HDFS Jira tickets as the knowledge base, and 11M lines of real HDFS cluster logs served from a local Loki instance.
 
 ---
 
 ## How it works
 
-The system has two pipelines. They share one database and one Drain template model, and nothing else.
+Two pipelines share one database, one redaction module, and one log-template model.
 
 ```
 INDEXING (offline, run once, then incrementally)
-  HDFS logs ──→ Drain ──→ template model ─────────────────┐
-                                                           ▼
   Jira API ──→ raw JSON ──→ clean ──→ redact ──→ extract logs ──→ normalize ──→ chunk ──→ embed ──→ Postgres
-                                                                                                     │
-QUERY (online, per new ticket)                                                                       │
-  New ticket ──→ same clean/redact/extract/normalize ──→ hybrid retrieval ◀──────────────────────────┘
-             ──→ rerank ──→ LLM diagnosis (cited, or abstain) ──→ redact output ──→ post to Jira
+                                                     │                                              │
+                                                     └──→ train template model (index tickets only) │
+                                                                                                    │
+QUERY (online, per new ticket)                                                                      │
+  New ticket ──→ same clean / redact / extract / normalize                                          │
+             ──→ LLM agent, with tools:                                                             │
+                   loki_labels · log_template_stats · loki_query · search_past_tickets ◀────────────┘
+             ──→ diagnosis (cited, or abstain) ──→ redact output ──→ post to Jira
 ```
 
-The query side reuses the indexing code for cleaning, redaction, and normalization. If a new ticket gets processed differently from indexed tickets, their template IDs and pseudonyms won't match and retrieval quietly degrades.
+The query side reuses the indexing code for cleaning, redaction, extraction, and normalization. If a new ticket were processed differently from indexed tickets, their template IDs and pseudonyms wouldn't match and retrieval would quietly degrade.
 
 ### Part 1: Indexing
 
-**1. Train the template model.** Drain streams all 11M HDFS log lines once and learns the templates. Masking rules replace variable values before mining, applied in order:
+**1. Fetch tickets.** Every resolved HDFS ticket (all types, not just bugs) comes from Apache's public Jira REST API, paged 100 at a time. Raw JSON is saved to `data/jira/raw_all/` first, so the API is hit once and every later step re-runs from disk.
 
-| Order | Mask | Example |
-|---|---|---|
-| 1 | `<IP>` | `10.251.43.21:50010` |
-| 2 | `<BLK>` | `blk_-1608999687919862906` |
-| 3 | `<EXC>` | `java.net.SocketTimeoutException: 480000 millis timeout...` |
-| 4 | `<PATH>` | `/user/root/rand/_temporary/.../part-00590` |
-| 5 | `<NUM>` | `67108864` |
+**2. Load.** Tickets go into a `tickets` table with the full raw JSON kept alongside, and every issue link goes into `ticket_links`.
 
-Order matters: IPs must be masked before the path and number rules can break them into pieces. The similarity threshold is 0.85, strict enough to keep `PacketResponder ... terminating` (a normal shutdown) separate from `PacketResponder ... Interrupted.` (a failure). The trained model is saved to disk and reused everywhere after that.
+**3. Clean.** Code and log blocks (`{code}`, `{noformat}`) are separated from prose and kept intact, indentation included, so log lines still match their templates. Blocks with an opening tag but no closing tag are recovered too. Jira wiki markup (`{{...}}`, `*bold*`, `h2.`, `[text|url]`, `[~user]`, images, non-breaking spaces) is stripped from the prose only.
 
-**2. Fetch tickets.** Every resolved HDFS ticket (all types, not just bugs) comes from Apache's public Jira REST API, paged 100 at a time. Raw JSON is saved to `data/jira/raw_all/` first, so the API is hit once and every later step re-runs from disk.
+Comments from four bot accounts (`hudson`, `hadoopqa`, `githubbot`, `genericqa`) are dropped: 60,692 comments, **34% of all comments**, almost all of it identical CI boilerplate. 116,685 human comments remain.
 
-**3. Load.** Tickets go into a `tickets` table with the full raw JSON kept alongside, and every issue link goes into `ticket_links`.
-
-**4. Clean.** Code and log blocks (`{code}`, `{noformat}`) are separated from prose and left byte-for-byte intact, so log lines still match their templates. Jira wiki markup (`{{...}}`, `*bold*`, `h2.`, `[text|url]`, images, non-breaking spaces) is stripped from the prose only. Comments from four bot accounts (`hudson`, `hadoopqa`, `githubbot`, `genericqa`) are dropped: together they posted 23,737 comments, more than the top 20 human contributors combined, almost all of it identical CI boilerplate.
-
-**5. Redact.** Secrets and PII are replaced with consistent pseudonyms in the summary, the prose, and every code block. Redaction runs last, on exactly the text that gets stored, so no later step can reassemble something the detectors never saw.
+**4. Redact.** Secrets and PII are replaced with consistent pseudonyms in the summary, the prose, and every code block. Redaction runs last, on exactly the text that gets stored, so no later step can reassemble something the detectors never saw.
 
 | Detector | How it decides |
 |---|---|
@@ -56,9 +48,45 @@ Order matters: IPs must be masked before the path and number rules can break the
 
 Each value becomes `<KIND_xxxxxxxx>`, where the suffix is an HMAC of the value with a secret key. The same email always gets the same tag, so retrieval can still tell that three tickets involve the same person without ever seeing who. The tags can't be reversed without the key.
 
-**6. Extract and normalize logs.** Log lines and stack traces are pulled out of `{code}`/`{noformat}` blocks. Each log line is looked up against the trained Drain model (lookup only, the model never learns from tickets) to get a template ID, and the exception class (e.g. `java.net.SocketTimeoutException`) is extracted separately. The raw text stays in the chunk. The template IDs and exception classes are stored alongside it.
+**5. Extract logs.** Log lines are found **by shape**, in both code blocks and prose: many tickets paste logs and stack traces straight into the text with no block around them. A line counts as a log line only if it has a timestamp, a level, and a `component:`, in one of the formats seen in the tickets:
 
-**7. Chunk.** Tickets are chunked by structure, not by fixed token windows:
+| Format | Example |
+|---|---|
+| HDFS cluster log | `081109 203518 143 INFO dfs.DataNode$PacketResponder: ...` |
+| Short date | `08/05/27 11:30:08 INFO mapred.JobClient: ...` |
+| log4j default | `2013-02-14 17:29:58,128 ERROR org.apache...: ...` |
+
+Exception lines (`java.io.IOException: ...`) are recorded by class. Stack frames are skipped: they change with every version. Lines with no real words after the prefix (empty messages, `-----` separators) are dropped.
+
+Across all tickets this finds 7,670 log lines and 2,891 exception lines. **32% of the log lines were in prose, not code blocks**; scanning blocks only would have missed a third of them.
+
+**6. Train the template model.** Drain learns log templates from the log lines extracted from **index tickets resolved before the 2018-12-06 cutoff**, so no test ticket's logs shape the vocabulary. Masking rules replace variable values before mining, applied in order:
+
+| Order | Mask | Example |
+|---|---|---|
+| 1 | `<IP>` | `10.251.43.21:50010` |
+| 2 | `<BLK>` | `blk_-1608999687919862906` |
+| 3 | `<EXC>` | `java.net.SocketTimeoutException: 480000 millis timeout...` |
+| 4 | `<PATH>` | `/user/root/rand/_temporary/.../part-00590` |
+| 5 | `<NUM>` | `67108864` |
+
+Order matters: IPs must be masked before the path and number rules can break them into pieces.
+
+The similarity threshold was chosen by comparing three values on the ticket logs (6,202 training lines):
+
+| sim_th | Templates | Seen once | Test lines matching a rare template |
+|---|---|---|---|
+| 0.85 | 2,012 | 57% | 24% |
+| **0.75** | **1,706** | **50%** | **25%** |
+| 0.65 | 1,532 | 49% | 27% |
+
+0.65 matches the most, but only because it merges messages with opposite meanings: `Comparision result: [pass]` and `[fail]` become one template, and different CLI commands collapse into one. **0.75** reduces one-off templates without merging anything that means something different. About half the templates are seen only once at every threshold: ticket logs are scattered, so the data, not the threshold, is the limit.
+
+The trained model is a build artifact, versioned in `models/drain_state.bin`, so the query side never needs the raw training data.
+
+**7. Normalize.** Each extracted log line is looked up against the model (lookup only; the model never learns at query time) to get a template ID. The exception class is extracted separately, because exception wording changes between versions.
+
+**8. Chunk.** Tickets are chunked by structure, not by fixed token windows:
 
 | Chunk | Content | Why separate |
 |-------|---------|--------------|
@@ -66,28 +94,61 @@ Each value becomes `<KIND_xxxxxxxx>`, where the suffix is an HMAC of the value w
 | Comment | One per substantive comment | Diagnosis happens in comments, often several replies in |
 | Resolution | Final comments + fix summary | What actually fixed it; this is what the diagnosis cites |
 
-Any chunk over ~500 tokens is split on paragraph boundaries with overlap. Every chunk has the ticket summary prepended before embedding, so a comment that just says "the lease recovery never ran" still carries its ticket context.
+Any chunk over ~500 tokens is split on paragraph boundaries with overlap. Every chunk has the ticket summary prepended before embedding, so a comment that just says "the lease recovery never ran" still carries its ticket context. Each chunk stores its template IDs and exception classes.
 
-**8. Embed and store.** Chunks are embedded with `bge-base-en-v1.5` and written to Postgres: the vector to a pgvector HNSW index, the text to a `tsvector` GIN index for BM25, and the template IDs to a GIN array index.
+**9. Embed and store.** Chunks are embedded with `bge-base-en-v1.5` and written to Postgres: the vector to a pgvector HNSW index, the text to a `tsvector` GIN index for BM25, and the template IDs to a GIN array index.
 
-### Part 2: Query
+### Part 2: Query, as an agent
 
-**1. Process the new ticket** with the same clean, redact, extract, and normalize code from indexing.
+A new ticket goes through the same clean, redact, extract, and normalize steps. Then an LLM agent, in a tool-calling loop written by hand with the Anthropic SDK, decides what evidence to gather.
 
-**2. Retrieve from three sources in parallel**, all restricted to tickets resolved before the query ticket was created:
+**Tools:**
+
+| Tool | What it does | Why it's designed this way |
+|---|---|---|
+| `loki_labels()` | Lists queryable labels and their values | The agent can't write a correct query without knowing which components and hosts exist |
+| `log_template_stats(selector, start, end)` | Runs a LogQL query, normalizes every line, and returns templates with counts compared to a baseline: **new**, **spiking**, **error** | The key tool. The agent sees a 20-row summary instead of 50,000 raw lines: fewer tokens, far more reliable |
+| `loki_query(logql, start, end, limit)` | A few raw lines, for a closer look at one template | Capped and redacted before the agent sees them |
+| `search_past_tickets(text, template_ids, exceptions)` | Hybrid retrieval over past tickets (below) | Connects log evidence to past incidents and their fixes |
+
+**Retrieval** (inside `search_past_tickets`), always restricted to tickets resolved before the query ticket was created:
 - **Dense**: cosine similarity on the embedding
 - **BM25**: full-text rank, strong on exact error strings and class names
 - **Template match**: overlap between the query's template IDs or exception classes and each chunk's
 
-**3. Fuse** the three ranked lists with Reciprocal Rank Fusion.
+The three ranked lists are fused with Reciprocal Rank Fusion, and the top 20 are reranked with a cross-encoder down to 5.
 
-**4. Rerank** the top 20 with a cross-encoder and keep the top 5.
+**Guardrails**, which replace the checks a human would otherwise make:
+- **Read-only.** No tool can change anything.
+- **Every LogQL query is validated before it runs:** it must have a stream selector, a time range of at most a few hours, and a line limit of at most ~500. Rejections go back to the agent with the reason, so it can fix the query.
+- **Hard limits:** at most ~6 tool calls per ticket, plus a total time and token budget. The loop always terminates.
+- **Tool errors are returned to the agent as results,** not raised. A bad query becomes `error: range exceeds 6h`, and the agent retries.
+- **Every tool result is redacted** before the agent sees it.
+- **Every call is logged:** tool, arguments, result size, latency. That's the audit trail.
 
-**5. Diagnose.** Claude gets the ticket and the top chunks and writes a diagnosis that cites specific tickets. If the evidence is weak, it abstains.
+**Diagnosis.** The agent writes a diagnosis that cites specific tickets and log templates. If the evidence is weak, it abstains. The diagnosis goes through `redact()` once more, since the LLM only saw pseudonyms but can still invent a plausible email or reconstruct something a detector missed. Then it's posted as a Jira comment.
 
-**6. Redact the output.** The diagnosis goes through `redact()` again before it leaves the system. The LLM only ever sees pseudonyms, but it can still invent a plausible email or reconstruct something a detector missed.
+---
 
-**7. Post** the diagnosis as a Jira comment.
+## Log evidence: two sources behind one interface
+
+```python
+class LogSource(Protocol):
+    def evidence(self, ticket: CleanTicket) -> Extracted: ...
+```
+
+| Implementation | Where log lines come from | Used for |
+|---|---|---|
+| `PastedLogSource` | Log lines pasted into the ticket | **The retrieval eval**, on real Apache tickets |
+| `LokiLogSource` | LogQL queries by the agent, over a time window | **The agent eval and demo**, on real HDFS cluster logs |
+
+**Why two sources:** no public dataset has tickets and logs from the same system at the same time. The Apache tickets come from the whole Hadoop community over 19 years; the HDFS logs come from one cluster over 38 hours in 2008. So the ticket eval uses the logs people pasted into tickets, and the Loki path is shown on real, time-consistent cluster logs with demo tickets written for labeled anomaly windows. Everything after the `LogSource` is the same code.
+
+**How this looks in production:** each ticket would get a log fingerprint from Loki when it's created (the ticket's service and time window, normalized to templates, compared to a baseline) and the fingerprint would be stored on the ticket. It has to be stored at that moment, because Loki keeps logs for a limited time: a year-old ticket has no logs left to query, only its saved fingerprint.
+
+**Loki setup notes:**
+- Loki rejects old timestamps by default. The 2008 logs need `reject_old_samples: false` in `limits_config`.
+- Labels are `component`, `level`, and `host` (~200 values). Block ID is deliberately **not** a label: 575,000 values would create 575,000 streams. Block IDs are searched with a line filter, `|= "blk_..."`, instead.
 
 ---
 
@@ -95,17 +156,15 @@ Any chunk over ~500 tokens is split on paragraph boundaries with overlap. Every 
 
 Two tickets describing the same failure rarely share text. Their stack traces contain different IPs, block IDs, ports, and timestamps. Embedding raw log text treats those as different, and keyword search misses them too.
 
-Drain collapses log lines into templates. `Transmitted block blk_-1608999687919862906 to /10.251.65.203:50010` becomes `<IP>:Transmitted block <BLK> to /<IP>`. Once normalized, two tickets with the same failure match on template ID, regardless of which machine or block was involved. Template match is one of the retrieval signals, measured alongside dense and BM25.
+Drain collapses log lines into templates. `Transmitted block blk_-1608999687919862906 to /10.251.65.203:50010` becomes `<IP>:Transmitted block <BLK> to /<IP>`. Once normalized, two tickets with the same failure match on template ID, regardless of which machine or block was involved.
 
 ---
 
 ## Data
 
-**Apache HDFS Jira**: 13,302 resolved HDFS tickets of every type (bugs, improvements, tasks, duplicates), pulled from Apache's public Jira, including summary, description, comments, and 11,201 issue links. This is the retrieval corpus. The links were created by Hadoop engineers while working the tickets and serve as ground truth.
+**Apache HDFS Jira**: 13,302 resolved HDFS tickets of every type (bugs, improvements, tasks, duplicates), pulled from Apache's public Jira, including summary, description, comments, and 11,201 issue links. This is the retrieval corpus. The links were created by Hadoop engineers while working the tickets and serve as ground truth. Links to other Apache projects (HADOOP, HBASE, YARN, ...) are out of scope.
 
-**HDFS v1 logs** from [LogHub](https://github.com/logpai/loghub): 11,175,629 lines over 38.7 hours from a real Hadoop cluster, with 29 ground-truth templates. Used to train and evaluate the Drain parser.
-
-**Scope note:** the logs and the tickets come from different sources and don't describe the same incidents. The logs are used for template vocabulary and parser evaluation, not to diagnose specific tickets. Links to other Apache projects (HADOOP, HBASE, YARN, ...) are out of scope.
+**HDFS v1 logs** from [LogHub](https://github.com/logpai/loghub): 11,175,629 lines over 38.7 hours from a real Hadoop cluster, with 29 ground-truth templates and labeled anomalous blocks. Used to validate the Drain configuration, and loaded into Loki for the agent eval and demo.
 
 ---
 
@@ -130,12 +189,19 @@ The main set measures finding related past incidents. The known-issue set measur
 
 For each test ticket, retrieval only searches tickets resolved before that ticket was created. This mirrors a live system: on the day a ticket arrives, it can search everything resolved up to that day, and never anything later. The query ticket itself is always excluded.
 
+### Agent eval
+
+For ~20 labeled anomaly windows in the HDFS logs, a short demo ticket describes the symptom. The anomaly labels come from the dataset; the ticket text is written by me, and results are reported with that caveat.
+
 ### Results
 
 | Component | Metric | Result |
 |-----------|--------|--------|
-| Drain parsing | Templates vs 29 ground-truth | 31: 29 map 1:1, 2 split by argument count |
+| Drain configuration | Templates on HDFS v1 vs 29 ground-truth | 31: 29 map 1:1, 2 split by argument count |
+| Cleaning | Leftover markup after cleaning | 9 of ~130,000 texts, all typo'd tags |
 | Redaction | Hits and sampled precision per detector | See below |
+| Log extraction | Log lines found in tickets | 7,670 log lines in 777 tickets (6%); exception lines in 1,770 tickets (13%) |
+| Template model | Test-ticket log lines matching a template learned from earlier tickets | 30% any template; 25% a rare template (seen in ≤20 tickets) |
 | Retrieval: dense only | Recall@5 / MRR | TBD |
 | Retrieval: BM25 only | Recall@5 / MRR | TBD |
 | Retrieval: template match only | Recall@5 / MRR | TBD |
@@ -143,6 +209,9 @@ For each test ticket, retrieval only searches tickets resolved before that ticke
 | Retrieval: RRF + rerank | Recall@5 / MRR | TBD |
 | Retrieval by link type | Recall@5 for Reference / Regression / Problem | TBD |
 | Known-issue detection | Hits out of 21 | TBD |
+| Agent: time window | Queried window overlaps the anomaly | TBD |
+| Agent: evidence | Fingerprint includes the anomalous blocks' templates | TBD |
+| Agent: cost | Tool calls, tokens, latency per ticket | TBD |
 | Diagnosis: LLM judge vs actual resolution | Agreement rate | TBD |
 | Diagnosis: hand-checked sample (n=20) | Agreement with judge | TBD |
 | Abstention | Rate, and accuracy when not abstaining | TBD |
@@ -158,6 +227,8 @@ Measured on all 12,788 ticket descriptions (9.4 MB). Precision was estimated by 
 | JWT | 2 | 2 | 2/2 | Both real signed-URL tokens. One payload decodes to an AWS access key ID, invisible to the AWS detector because it's base64-encoded. |
 | EMAIL | 202 | 180 | ~7/10 real emails | `example.com` principals allowlisted. Remaining non-emails are shell prompts and Kerberos principals exposing internal hostnames, masked on purpose. |
 
+Across descriptions and comments together: 759 emails and 2 credentials redacted.
+
 **Throughput:** 11 MB/s on one core, about 25 core-hours per TB. A parallel batch backfill handles that easily; an NER model for names would be the bottleneck and would run on prose fields only.
 
 **Known limitations:** secrets that are base64-encoded or compressed aren't detected. Short-lived HDFS checkpoint tokens (`token=-32:1989...:...`) pass through, because they contain no letters. Names aren't detected yet; that needs an NER model such as Presidio.
@@ -168,9 +239,10 @@ Measured on all 12,788 ticket descriptions (9.4 MB). Precision was estimated by 
 
 - **Python 3.12**, `uv`
 - **PostgreSQL + pgvector**: tickets, chunks, embeddings, full-text search
+- **Loki**: log storage and LogQL, run locally in Docker
 - **Drain3**: log template mining
 - **sentence-transformers**: `BAAI/bge-base-en-v1.5` embeddings, `bge-reranker-base` cross-encoder
-- **Claude API**: diagnosis generation and LLM-judge eval
+- **Anthropic SDK**: hand-written tool-use loop, diagnosis, LLM-judge eval
 - **httpx**, **psycopg**, **pydantic**, **pytest**
 
 ---
@@ -180,26 +252,30 @@ Measured on all 12,788 ticket descriptions (9.4 MB). Precision was estimated by 
 ```
 triagerag/
 ├── src/triagerag/
-│   ├── shared/          # used by both pipelines
-│   │   ├── clean.py     #   code-block split, Jira markup stripping, bot-comment filter
-│   │   ├── redact.py    #   secret and PII detection, HMAC pseudonyms
-│   │   ├── extract.py   #   pull log lines and stack traces from code blocks
-│   │   └── normalize.py #   Drain template lookup + exception class
-│   ├── index/           # Part 1
-│   │   ├── logs/        #   HDFS reader, Drain training
-│   │   ├── jira.py      #   fetch and load tickets and links
+│   ├── shared/            # used by both pipelines
+│   │   ├── clean.py       #   code-block split, Jira markup stripping, bot-comment filter
+│   │   ├── redact.py      #   secret and PII detection, HMAC pseudonyms
+│   │   ├── extract.py     #   log lines and exceptions found by shape, in blocks and prose
+│   │   └── normalize.py   #   template lookup + exception class
+│   ├── index/             # Part 1
+│   │   ├── logs/          #   HDFS reader, Drain training
+│   │   ├── jira.py        #   fetch and load tickets and links
 │   │   ├── chunk.py
 │   │   └── embed.py
-│   ├── query/           # Part 2
-│   │   ├── retrieve.py  #   dense, BM25, template match
-│   │   ├── fuse.py      #   RRF + rerank
-│   │   ├── diagnose.py  #   LLM diagnosis, abstention
-│   │   └── post.py      #   Jira comment
-│   └── eval/            # retrieval and diagnosis evaluation
-├── scripts/             # entrypoints: train_drain.py, fetch_jira.py, load_jira.py,
-│                        #   bench_redact.py, inspect_redact.py, ...
+│   ├── query/             # Part 2
+│   │   ├── retrieve.py    #   dense, BM25, template match, RRF, rerank
+│   │   ├── logsource.py   #   LogSource: PastedLogSource, LokiLogSource
+│   │   ├── tools.py       #   tool definitions, LogQL validation, guardrails
+│   │   ├── agent.py       #   tool-use loop, limits, audit log
+│   │   └── post.py        #   Jira comment
+│   └── eval/              # retrieval, agent, and diagnosis evaluation
+├── models/
+│   └── drain_state.bin    # trained template model, versioned in git
+├── scripts/               # entrypoints: fetch_jira.py, load_jira.py, train_drain.py,
+│                          #   bench_redact.py, inspect_redact.py, check_clean.py, ...
 ├── tests/
-└── data/                # gitignored: HDFS logs, Drain state, raw Jira JSON
+├── loki-config.yaml
+└── data/                  # gitignored: raw Jira JSON, HDFS logs
 ```
 
 ---
@@ -211,23 +287,25 @@ git clone https://github.com/Parinita789/triagerag
 cd triagerag
 uv sync
 
-docker compose up -d
+docker compose up -d          # Postgres + Loki
 docker compose exec -T db psql -U postgres -d triagerag -f - < scripts/schema.sql
-
-# HDFS logs for Drain
-mkdir -p data && cd data
-curl -L "https://zenodo.org/records/8196385/files/HDFS_v1.zip?download=1" -o HDFS_v1.zip
-unzip HDFS_v1.zip && cd ..
-uv run python scripts/train_drain.py --retrain
 
 # Jira tickets
 uv run python scripts/fetch_jira.py
 uv run python scripts/load_jira.py
+
+# HDFS logs (for Loki and Drain validation)
+mkdir -p data && cd data
+curl -L "https://zenodo.org/records/8196385/files/HDFS_v1.zip?download=1" -o HDFS_v1.zip
+unzip HDFS_v1.zip && cd ..
 ```
+
+The trained template model is committed in `models/`, so retraining is only needed after changing the masking rules or the threshold.
 
 `.env`:
 ```
 DATABASE_URL=postgresql://postgres:dev@localhost:5433/triagerag
+LOKI_URL=http://localhost:3100
 ANTHROPIC_API_KEY=...
 ```
 
@@ -239,13 +317,13 @@ ANTHROPIC_API_KEY=...
 |-------|-------------|--------|
 | 0 | Skeleton, Docker, schema | ✅ |
 | 1 | HDFS log reader | ✅ |
-| 2 | Drain parsing, masking, template lookup | ✅ |
+| 2 | Drain configuration: masking, threshold, template lookup | ✅ |
 | 3 | Jira ingestion: tickets, links, eval query sets | ✅ |
-| 4 | Redaction ✅, cleaning, log extraction, chunking, embedding | 🔄 |
-| 5 | Hybrid retrieval, temporal filter, ablation | ⬜ |
-| 6 | Triage pipeline: cited diagnosis, abstention | ⬜ |
-| 7 | Diagnosis evaluation: LLM judge + hand check | ⬜ |
-| 8 | Jira Cloud integration: webhook, auto-post | ⬜ |
+| 4 | Redaction ✅, cleaning ✅, log extraction ✅, template model from ticket logs ✅, chunking, embedding | 🔄 |
+| 5 | Hybrid retrieval, temporal filter, ablation → becomes `search_past_tickets` | ⬜ |
+| 6 | Agent loop, written by hand: tool definitions, call/result loop, limits, audit log. First with `search_past_tickets` only, on the ticket eval | ⬜ |
+| 7 | Loki: local instance, HDFS logs loaded, Loki tools and LogQL guardrails, agent eval on anomaly windows | ⬜ |
+| 8 | Diagnosis eval (LLM judge + hand check), Jira Cloud webhook and posting | ⬜ |
 
 ---
 
@@ -257,7 +335,29 @@ ANTHROPIC_API_KEY=...
 
 **Duplicate links don't work as ground truth for fixed bugs.** A fixed bug's duplicates are filed after it, so the temporal filter correctly hides them. Using them would have leaked answers. Duplicates work only in the other direction, as the known-issue slice.
 
-**Redaction before indexing, before the LLM, and after it.** Apache Jira is public, but the pipeline is built for private ticket systems. Secrets and PII are replaced with pseudonyms before chunking, embedding, or any LLM call, on both the indexing and query paths, and the LLM's output is redacted again before it's posted. Secrets are never unmasked. PII isn't unmasked either: diagnoses cite tickets by key, and readers follow the link to the original in Jira, where Jira's own permissions apply.
+**Ground truth from engineers, not from me.** Every relevance label is an issue link Hadoop engineers created while working the tickets. I didn't author any labels.
+
+**Don't embed raw logs.** Logs are huge, highly repetitive (11M HDFS lines collapse into 31 templates), and triage questions are about time, counts, exact IDs, and absence, which LogQL answers directly and vector similarity can't. The vector index holds tickets. Logs contribute template IDs and exception classes as chunk metadata, and live evidence comes from LogQL.
+
+**Give the agent high-level tools, not raw access.** `log_template_stats` returns templates with counts against a baseline, not raw lines. An agent handed 50,000 lines drowns in them; an agent handed a 20-row summary sees the anomaly.
+
+**Guardrails in code, not in the prompt.** Query validation, time-range and line limits, a tool-call budget, and redaction of every tool result are enforced by the tool layer. A prompt can ask the agent to behave; only code can guarantee it.
+
+**The agent loop is written by hand.** Tool definitions, the call/result loop, retries, and limits use the Anthropic SDK directly, with no agent framework, so every step is visible and debuggable.
+
+**Train templates on the tickets' own logs.** The 2008 cluster covers one component set in one version; the tickets span 19 years of HDFS. Templates are learned from log lines in index tickets resolved before the cutoff, which mirrors training on the logs of the systems the tickets are about. The HDFS logs validated the Drain configuration: 31 templates, 29 matching the ground truth one to one.
+
+**Weight templates by how many tickets contain them, not by how many lines.** The biggest templates by line count are test-harness output pasted by a handful of tickets, and the most widespread are startup and shutdown lines like `SHUTDOWN_MSG`. Neither says anything about a specific failure. Template IDs are scored like words in BM25: a template found in few tickets counts a lot, one found in many counts for little. No hand-written blocklist.
+
+**Template matching is a supporting signal, measured where it can help.** Only 6% of tickets contain log lines. On the full query set it can barely move recall, so its contribution is reported on the subset of queries that contain logs or exceptions.
+
+**Find logs by shape, not only in code blocks.** Older tickets often paste logs and stack traces straight into the text. Scanning only `{code}` blocks would miss them, and those older tickets are the ones closest to the logs the model knows.
+
+**Exceptions masked in templates, kept as a separate field.** Exception wording changes between Hadoop versions and includes typos and varying timeout values. Keeping it inside the template would give the same failure different IDs. The template captures the event's structure, and the exception class is stored separately as its own signal.
+
+**The trained model is a versioned artifact.** `models/drain_state.bin` is committed to git. Anyone who clones the repo can triage without downloading 1.5GB of logs, and a retrain that changes the templates shows up as a diff.
+
+**Redaction before indexing, before the LLM, and after it.** Apache Jira is public, but the pipeline is built for private ticket systems. Secrets and PII are replaced with pseudonyms before chunking, embedding, or any LLM call, on both paths, every tool result is redacted before the agent sees it, and the output is redacted again before it's posted. Secrets are never unmasked. PII isn't unmasked either: diagnoses cite tickets by key, and readers follow the link to the original in Jira, where Jira's own permissions apply.
 
 **When unsure, redact.** The two kinds of error don't cost the same: masking a hostname loses a little retrieval signal, missing a secret is a leak that can't be undone. Detectors were tuned to remove noise (125 fake card numbers) but not to un-mask borderline infrastructure identifiers.
 
@@ -265,14 +365,10 @@ ANTHROPIC_API_KEY=...
 
 **Raw ticket JSON is stored unredacted, here only.** The `tickets.raw` column keeps the original JSON because this data is public. A production deployment would store only redacted text and leave the original in Jira.
 
-**Commenter usernames are kept.** Engineer names in internal tickets are useful context ("the fix came from the lease-recovery owner") and usually not sensitive. Customer names would be. In production, name detection would allowlist the employee directory.
-
-**Ground truth from engineers, not from me.** Every relevance label is an issue link Hadoop engineers created while working the tickets. I didn't author any labels.
-
-**Exceptions masked in templates, kept as a separate field.** Exception wording changes between Hadoop versions and includes typos and varying timeout values. Keeping it inside the template would give the same failure different IDs. The template captures the event's structure, and the exception class is stored separately as its own signal.
+**Commenter usernames are kept.** Engineer names in internal tickets are useful context and usually not sensitive. Customer names would be. In production, name detection would allowlist the employee directory.
 
 **Template match as its own retrieval signal.** Log snippets are where embeddings and keyword search both struggle. Normalizing them first, then matching on template IDs, is measured separately so its contribution shows up in the ablation.
 
-**Abstention is a first-class outcome.** When retrieved evidence is weak, the pipeline says so instead of guessing. A confident wrong diagnosis on a production incident is worse than none.
+**Abstention is a first-class outcome.** When evidence is weak, the pipeline says so instead of guessing. A confident wrong diagnosis on a production incident is worse than none.
 
 **The LLM judge gets checked.** Diagnosis quality is scored by an LLM against the real resolution, then a hand-checked sample measures how far that judge can be trusted.

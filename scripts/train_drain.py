@@ -8,6 +8,7 @@ from triagerag.config import settings
 from triagerag.index.logs.reader import iter_lines
 from triagerag.index.logs.drain import DEFAULT_STATE_PATH, build_miner, load_miner
 
+
 def save_templates(miner: TemplateMiner) -> int:
     """Upsert every Drain cluster into the templates table. Returns count written."""
     clusters = miner.drain.clusters
@@ -45,7 +46,6 @@ def main() -> None:
             if n % 1_000_000 == 0:
                 print(f"  {n:,} lines — {len(miner.drain.clusters)} templates so far")
 
-        # Periodic snapshots can lag the last few lines; always save the final state.
         miner.save_state("training complete")
         print(f"saved state to {DEFAULT_STATE_PATH}")
 

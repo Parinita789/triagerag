@@ -11,18 +11,18 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_terminating_and_interrupted_are_different_templates() -> None:
-    terminating = normalize("PacketResponder 1 for block blk_38865049064139660 terminating")
-    interrupted = normalize("PacketResponder 0 for block blk_4241467193520768333 Interrupted.")
+def test_pass_and_fail_are_different_templates() -> None:
+    passed = normalize("Comparision result: [pass]")
+    failed = normalize("Comparision result: [fail]")
 
-    assert terminating.template_id is not None
-    assert interrupted.template_id is not None
-    assert terminating.template_id != interrupted.template_id
+    assert passed.template_id is not None
+    assert failed.template_id is not None
+    assert passed.template_id != failed.template_id
 
 
-def test_different_ips_and_blocks_same_template() -> None:
-    a = normalize("10.251.43.21:50010:Transmitted block blk_-1608999687919862906 to /10.250.7.230:50010")
-    b = normalize("10.251.65.237:50010:Transmitted block blk_7503483334202473044 to /10.251.30.179:50010")
+def test_different_numbers_same_template() -> None:
+    a = normalize("Waiting for ack for: 12")
+    b = normalize("Waiting for ack for: 4071")
 
     assert a.template_id is not None
     assert a.template_id == b.template_id
