@@ -14,14 +14,14 @@ The system has two pipelines. They share one database and one Drain template mod
 INDEXING (offline, run once, then incrementally)
   HDFS logs ──→ Drain ──→ template model ─────────────────┐
                                                            ▼
-  Jira API ──→ raw JSON ──→ clean ──→ extract logs ──→ normalize ──→ chunk ──→ embed ──→ Postgres
-                                                                                           │
-QUERY (online, per new ticket)                                                             │
-  New ticket ──→ same clean/extract/normalize ──→ hybrid retrieval ◀───────────────────────┘
-             ──→ rerank ──→ LLM diagnosis (cited, or abstain) ──→ post to Jira
+  Jira API ──→ raw JSON ──→ clean ──→ redact ──→ extract logs ──→ normalize ──→ chunk ──→ embed ──→ Postgres
+                                                                                                     │
+QUERY (online, per new ticket)                                                                       │
+  New ticket ──→ same clean/redact/extract/normalize ──→ hybrid retrieval ◀──────────────────────────┘
+             ──→ rerank ──→ LLM diagnosis (cited, or abstain) ──→ redact output ──→ post to Jira
 ```
 
-The query side reuses the indexing code for cleaning and normalization. If a new ticket gets processed differently from indexed tickets, their template IDs won't match and retrieval quietly degrades.
+The query side reuses the indexing code for cleaning, redaction, and normalization. If a new ticket gets processed differently from indexed tickets, their template IDs and pseudonyms won't match and retrieval quietly degrades.
 
 ### Part 1: Indexing
 
@@ -41,11 +41,24 @@ Order matters: IPs must be masked before the path and number rules can break the
 
 **3. Load.** Tickets go into a `tickets` table with the full raw JSON kept alongside, and every issue link goes into `ticket_links`.
 
-**4. Clean.** Jira wiki markup (`{code}`, `{noformat}`, `{{...}}`, non-breaking spaces) is stripped from prose. Comments from four bot accounts (`hudson`, `hadoopqa`, `githubbot`, `genericqa`) are dropped: together they posted 23,737 comments, more than the top 20 human contributors combined, almost all of it identical CI boilerplate.
+**4. Clean.** Code and log blocks (`{code}`, `{noformat}`) are separated from prose and left byte-for-byte intact, so log lines still match their templates. Jira wiki markup (`{{...}}`, `*bold*`, `h2.`, `[text|url]`, images, non-breaking spaces) is stripped from the prose only. Comments from four bot accounts (`hudson`, `hadoopqa`, `githubbot`, `genericqa`) are dropped: together they posted 23,737 comments, more than the top 20 human contributors combined, almost all of it identical CI boilerplate.
 
-**5. Extract and normalize logs.** Log lines and stack traces are pulled out of `{code}`/`{noformat}` blocks. Each log line is looked up against the trained Drain model (lookup only, the model never learns from tickets) to get a template ID, and the exception class (e.g. `java.net.SocketTimeoutException`) is extracted separately. The raw text stays in the chunk. The template IDs and exception classes are stored alongside it.
+**5. Redact.** Secrets and PII are replaced with consistent pseudonyms in the summary, the prose, and every code block. Redaction runs last, on exactly the text that gets stored, so no later step can reassemble something the detectors never saw.
 
-**6. Chunk.** Tickets are chunked by structure, not by fixed token windows:
+| Detector | How it decides |
+|---|---|
+| Private keys | Multi-line `BEGIN ... PRIVATE KEY` blocks, matched first |
+| AWS keys, GitHub tokens, JWTs | Known prefix and length |
+| Credentials | A keyword (`password=`, `token:`, ...) **and** a value that looks generated: 16+ chars, letters and digits, no code or placeholder characters, entropy > 3.5 |
+| URL credentials | `user:pass@` inside URLs |
+| Emails | Regex, with reserved documentation domains (`example.com`) allowlisted |
+| Card numbers | 16 digits or 4 groups of 4 with one consistent separator, not glued to an ID, and passing Luhn |
+
+Each value becomes `<KIND_xxxxxxxx>`, where the suffix is an HMAC of the value with a secret key. The same email always gets the same tag, so retrieval can still tell that three tickets involve the same person without ever seeing who. The tags can't be reversed without the key.
+
+**6. Extract and normalize logs.** Log lines and stack traces are pulled out of `{code}`/`{noformat}` blocks. Each log line is looked up against the trained Drain model (lookup only, the model never learns from tickets) to get a template ID, and the exception class (e.g. `java.net.SocketTimeoutException`) is extracted separately. The raw text stays in the chunk. The template IDs and exception classes are stored alongside it.
+
+**7. Chunk.** Tickets are chunked by structure, not by fixed token windows:
 
 | Chunk | Content | Why separate |
 |-------|---------|--------------|
@@ -55,11 +68,11 @@ Order matters: IPs must be masked before the path and number rules can break the
 
 Any chunk over ~500 tokens is split on paragraph boundaries with overlap. Every chunk has the ticket summary prepended before embedding, so a comment that just says "the lease recovery never ran" still carries its ticket context.
 
-**7. Embed and store.** Chunks are embedded with `bge-base-en-v1.5` and written to Postgres: the vector to a pgvector HNSW index, the text to a `tsvector` GIN index for BM25, and the template IDs to a GIN array index.
+**8. Embed and store.** Chunks are embedded with `bge-base-en-v1.5` and written to Postgres: the vector to a pgvector HNSW index, the text to a `tsvector` GIN index for BM25, and the template IDs to a GIN array index.
 
 ### Part 2: Query
 
-**1. Process the new ticket** with the same clean, extract, and normalize code from indexing.
+**1. Process the new ticket** with the same clean, redact, extract, and normalize code from indexing.
 
 **2. Retrieve from three sources in parallel**, all restricted to tickets resolved before the query ticket was created:
 - **Dense**: cosine similarity on the embedding
@@ -72,7 +85,9 @@ Any chunk over ~500 tokens is split on paragraph boundaries with overlap. Every 
 
 **5. Diagnose.** Claude gets the ticket and the top chunks and writes a diagnosis that cites specific tickets. If the evidence is weak, it abstains.
 
-**6. Post** the diagnosis as a Jira comment.
+**6. Redact the output.** The diagnosis goes through `redact()` again before it leaves the system. The LLM only ever sees pseudonyms, but it can still invent a plausible email or reconstruct something a detector missed.
+
+**7. Post** the diagnosis as a Jira comment.
 
 ---
 
@@ -120,6 +135,7 @@ For each test ticket, retrieval only searches tickets resolved before that ticke
 | Component | Metric | Result |
 |-----------|--------|--------|
 | Drain parsing | Templates vs 29 ground-truth | 31: 29 map 1:1, 2 split by argument count |
+| Redaction | Hits and sampled precision per detector | See below |
 | Retrieval: dense only | Recall@5 / MRR | TBD |
 | Retrieval: BM25 only | Recall@5 / MRR | TBD |
 | Retrieval: template match only | Recall@5 / MRR | TBD |
@@ -130,6 +146,21 @@ For each test ticket, retrieval only searches tickets resolved before that ticke
 | Diagnosis: LLM judge vs actual resolution | Agreement rate | TBD |
 | Diagnosis: hand-checked sample (n=20) | Agreement with judge | TBD |
 | Abstention | Rate, and accuracy when not abstaining | TBD |
+
+### Redaction
+
+Measured on all 12,788 ticket descriptions (9.4 MB). Precision was estimated by reading a random sample of hits for each detector, then fixing the detector and measuring again.
+
+| Detector | First run | After fixes | Precision (sampled) | What changed |
+|---|---|---|---|---|
+| CARD | 125 | 0 | 0/10 before, all false positives | Block IDs, storage IDs, timestamps, file sizes. About 1 in 10 random numbers passes Luhn by chance, so a checksum alone isn't enough. Now requires real card formatting and word boundaries. |
+| CREDENTIAL | 14 | 1 | 1/1 | 13 false positives were code (`fs.getDelegationToken(renewer)`), log text (`Token: No`), config key names, and placeholders. Now the value itself must look generated. |
+| JWT | 2 | 2 | 2/2 | Both real signed-URL tokens. One payload decodes to an AWS access key ID, invisible to the AWS detector because it's base64-encoded. |
+| EMAIL | 202 | 180 | ~7/10 real emails | `example.com` principals allowlisted. Remaining non-emails are shell prompts and Kerberos principals exposing internal hostnames, masked on purpose. |
+
+**Throughput:** 11 MB/s on one core, about 25 core-hours per TB. A parallel batch backfill handles that easily; an NER model for names would be the bottleneck and would run on prose fields only.
+
+**Known limitations:** secrets that are base64-encoded or compressed aren't detected. Short-lived HDFS checkpoint tokens (`token=-32:1989...:...`) pass through, because they contain no letters. Names aren't detected yet; that needs an NER model such as Presidio.
 
 ---
 
@@ -150,7 +181,8 @@ For each test ticket, retrieval only searches tickets resolved before that ticke
 triagerag/
 ├── src/triagerag/
 │   ├── shared/          # used by both pipelines
-│   │   ├── clean.py     #   Jira markup stripping, bot-comment filter
+│   │   ├── clean.py     #   code-block split, Jira markup stripping, bot-comment filter
+│   │   ├── redact.py    #   secret and PII detection, HMAC pseudonyms
 │   │   ├── extract.py   #   pull log lines and stack traces from code blocks
 │   │   └── normalize.py #   Drain template lookup + exception class
 │   ├── index/           # Part 1
@@ -164,7 +196,8 @@ triagerag/
 │   │   ├── diagnose.py  #   LLM diagnosis, abstention
 │   │   └── post.py      #   Jira comment
 │   └── eval/            # retrieval and diagnosis evaluation
-├── scripts/             # entrypoints: train_drain.py, fetch_jira.py, load_jira.py, ...
+├── scripts/             # entrypoints: train_drain.py, fetch_jira.py, load_jira.py,
+│                        #   bench_redact.py, inspect_redact.py, ...
 ├── tests/
 └── data/                # gitignored: HDFS logs, Drain state, raw Jira JSON
 ```
@@ -208,7 +241,7 @@ ANTHROPIC_API_KEY=...
 | 1 | HDFS log reader | ✅ |
 | 2 | Drain parsing, masking, template lookup | ✅ |
 | 3 | Jira ingestion: tickets, links, eval query sets | ✅ |
-| 4 | Cleaning, log extraction, chunking, embedding | ⬜ |
+| 4 | Redaction ✅, cleaning, log extraction, chunking, embedding | 🔄 |
 | 5 | Hybrid retrieval, temporal filter, ablation | ⬜ |
 | 6 | Triage pipeline: cited diagnosis, abstention | ⬜ |
 | 7 | Diagnosis evaluation: LLM judge + hand check | ⬜ |
@@ -223,6 +256,16 @@ ANTHROPIC_API_KEY=...
 **Index every ticket type, not just fixed bugs.** Bugs link mostly to the improvements, tasks, and duplicates around them. The first corpus of 4,110 fixed bugs was missing most link targets. Widening to all 13,302 resolved tickets raised usable queries from 61 to 163, and it matches how an engineer actually searches.
 
 **Duplicate links don't work as ground truth for fixed bugs.** A fixed bug's duplicates are filed after it, so the temporal filter correctly hides them. Using them would have leaked answers. Duplicates work only in the other direction, as the known-issue slice.
+
+**Redaction before indexing, before the LLM, and after it.** Apache Jira is public, but the pipeline is built for private ticket systems. Secrets and PII are replaced with pseudonyms before chunking, embedding, or any LLM call, on both the indexing and query paths, and the LLM's output is redacted again before it's posted. Secrets are never unmasked. PII isn't unmasked either: diagnoses cite tickets by key, and readers follow the link to the original in Jira, where Jira's own permissions apply.
+
+**When unsure, redact.** The two kinds of error don't cost the same: masking a hostname loses a little retrieval signal, missing a secret is a leak that can't be undone. Detectors were tuned to remove noise (125 fake card numbers) but not to un-mask borderline infrastructure identifiers.
+
+**Every real false positive becomes a test.** Each false positive found while inspecting hits on real tickets is a negative test case, so a future pattern change can't quietly bring it back.
+
+**Raw ticket JSON is stored unredacted, here only.** The `tickets.raw` column keeps the original JSON because this data is public. A production deployment would store only redacted text and leave the original in Jira.
+
+**Commenter usernames are kept.** Engineer names in internal tickets are useful context ("the fix came from the lease-recovery owner") and usually not sensitive. Customer names would be. In production, name detection would allowlist the employee directory.
 
 **Ground truth from engineers, not from me.** Every relevance label is an issue link Hadoop engineers created while working the tickets. I didn't author any labels.
 
