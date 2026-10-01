@@ -1,6 +1,7 @@
 from collections.abc import Iterator
 from dataclasses import dataclass
-
+from datetime import datetime
+from triagerag.shared.clean import CleanText, CleanTicket, parse_jira_ts
 from triagerag.shared.clean import CleanText, CleanTicket
 from triagerag.shared.extract import extract
 import re
@@ -23,9 +24,10 @@ class Chunk:
     content: str
     template_ids: list[int]
     exceptions: list[str]
+    created_at: datetime
 
 
-def _render(text: CleanText) -> str:
+def render(text: CleanText) -> str:
     """Prose plus code blocks, each block cut to MAX_BLOCK_LINES."""
     parts = [text.prose] if text.prose else []
     for block in text.blocks:
@@ -75,17 +77,17 @@ def _is_chatter(rendered: str) -> bool:
 
 def chunk_ticket(t: CleanTicket) -> list[Chunk]:
     header = f"[{t.key}] {t.summary}"
-    human = []
+    human_comments = []
     for c in t.comments:
-        rendered = _render(c.text)
+        rendered = render(c.text)
         if len(rendered) >= MIN_COMMENT_CHARS and not _is_chatter(rendered):
-            human.append(c.text)
+            human_comments.append(c)
 
-    sections: list[tuple[str, list[CleanText]]] = [("problem", [t.description])]
-    sections += [("comment", [c]) for c in human]
+    sections: list[tuple[str, list[CleanText], str]] = [("problem", [t.description], t.created)]
+    sections += [("comment", [c.text], c.created) for c in human_comments]
 
     chunks: list[Chunk] = []
-    for section, texts in sections:
+    for section, texts, created in sections:
         template_ids: set[int] = set()
         exceptions: set[str] = set()
         for text in texts:
@@ -93,8 +95,9 @@ def chunk_ticket(t: CleanTicket) -> list[Chunk]:
             template_ids |= ex.template_ids
             exceptions |= ex.exception_classes
 
-        body = "\n\n".join(_render(text) for text in texts).strip()
+        body = "\n\n".join(render(text) for text in texts).strip()
         for piece in _split(body) or [""]:
             content = f"{header}\n\n{piece}" if piece else header
-            chunks.append(Chunk(t.key, section, content, sorted(template_ids), sorted(exceptions)))
+            chunks.append(Chunk(t.key, section, content, sorted(template_ids),
+            sorted(exceptions), parse_jira_ts(created)))
     return chunks

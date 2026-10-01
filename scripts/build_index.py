@@ -12,8 +12,8 @@ from triagerag.shared.clean import clean_ticket
 
 TICKETS_PER_BATCH = 200
 INSERT = """insert into chunks (ticket_key, section, content,
-                                template_ids, exception_signatures, embedding)
-            values (%s, %s, %s, %s, %s, %s)"""
+                                template_ids, exception_signatures, embedding, created_at)
+            values (%s, %s, %s, %s, %s, %s, %s)"""
 
 
 def main() -> None:
@@ -49,7 +49,7 @@ def main() -> None:
 
             with conn.cursor() as cur:
                 cur.executemany(INSERT, [
-                    (c.ticket_key, c.section, c.content, c.template_ids, c.exceptions, v)
+                    (c.ticket_key, c.section, c.content, c.template_ids, c.exceptions, v, c.created_at)
                     for c, v in zip(chunks, vectors)
                 ])
             conn.commit()

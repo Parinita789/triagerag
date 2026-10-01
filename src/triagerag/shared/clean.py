@@ -2,6 +2,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
+from datetime import datetime
 
 from triagerag.shared.redact import redact
 
@@ -41,10 +42,17 @@ class CleanComment:
 class CleanTicket:
     key: str
     summary: str
+    created: str
     description: CleanText
     comments: list[CleanComment]
     redactions: Counter[str]
     bot_comments_dropped: int
+
+JIRA_TS = "%Y-%m-%dT%H:%M:%S.%f%z"
+
+
+def parse_jira_ts(value: str) -> datetime:
+    return datetime.strptime(value, JIRA_TS)
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -116,4 +124,4 @@ def clean_ticket(issue: dict[str, Any]) -> CleanTicket:
         if text.prose or text.blocks:
             comments.append(CleanComment(cm["author"]["name"], cm["created"], text))
 
-    return CleanTicket(issue["key"], summary, description, comments, counts, dropped)
+    return CleanTicket(issue["key"], summary, f["created"], description, comments, counts, dropped)

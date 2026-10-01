@@ -123,12 +123,13 @@ A new ticket goes through the same clean, redact, extract, and normalize steps. 
 | `loki_query(logql, start, end, limit)` | A few raw lines, for a closer look at one template | Capped and redacted before the agent sees them |
 | `search_past_tickets(text, template_ids, exceptions)` | Hybrid retrieval over past tickets (below) | Connects log evidence to past incidents and their fixes |
 
-**Retrieval** (inside `search_past_tickets`), always restricted to tickets resolved before the query ticket was created:
-- **Dense**: cosine similarity on the embedding
-- **BM25**: full-text rank, strong on exact error strings and class names
-- **Template match**: overlap between the query's template IDs or exception classes and each chunk's
+**Retrieval** (inside `search_past_tickets`) searches only chunks written before the query ticket was created, from tickets resolved before it:
+- **Dense**: cosine similarity between the query embedding and each chunk's
+- **BM25**: a hand-written BM25 over an in-memory inverted index; strong on exact class names, config keys, and error strings
 
-The three ranked lists are fused with Reciprocal Rank Fusion, and the top 20 are reranked with a cross-encoder down to 5.
+Chunks are grouped into tickets (each ticket scored by its best chunk), and the two ranked ticket lists (top 50 each) are fused with Reciprocal Rank Fusion: `score = Σ 1 / (60 + rank)`. RRF uses ranks, not raw scores, so cosine similarities and BM25 scores never need to be put on the same scale.
+
+A cross-encoder reranker and template-ID matching were both built and measured, and both were left out. See Evaluation.
 
 **Guardrails**, which replace the checks a human would otherwise make:
 - **Read-only.** No tool can change anything.
@@ -197,9 +198,25 @@ Not every link is an answer. A link counts as a right answer for a test ticket o
 
 The main set measures finding related past incidents. The known-issue set measures recognizing a re-reported, already-solved bug. With only 21 queries, known-issue results are reported as counts (e.g. 18/21), not percentages.
 
+### What a query is
+
+A query is what the ticket looked like **when it was filed**: its summary and description. Comments are excluded, because they're written later and often name the related ticket ("this looks like a regression from HDFS-1234"). Ticket keys like `HDFS-1234` are also stripped from the query, so retrieval can't find an answer by exact-matching a key the reporter already knew.
+
 ### Per-query temporal filter
 
-For each test ticket, retrieval only searches tickets resolved before that ticket was created. This mirrors a live system: on the day a ticket arrives, it can search everything resolved up to that day, and never anything later. The query ticket itself is always excluded.
+For each query, retrieval only searches **chunks written before the query was created**, from **tickets resolved before it**. This mirrors a live system: on the day a ticket arrives, it can search everything up to that day, and never anything later. The query ticket itself is always excluded.
+
+The first version filtered only on when each ticket was resolved. But comments can be added to a ticket after it's resolved, sometimes because of the newer ticket. Every chunk now carries its own creation time. Measured effect: one query of 163 had been found through a later comment.
+
+### Dev and test sets
+
+| Set | Queries | Used for |
+|---|---|---|
+| **Dev**: fixed bugs filed 2016-12-06 to 2018-12-06 | 160 | Choosing between variants |
+| **Test**: fixed bugs filed after 2018-12-06 | 163 | Reporting final numbers, once |
+| **Known-issue**: duplicates of an already-fixed bug, filed after 2018-12-06 | 21 | Reporting, once |
+
+Variants were chosen on dev, with the decision rule written down before each run: adopt a variant only if it beats the current pipeline on Hit@5 with p < 0.05 on a two-sided sign test. The test set was used to report numbers, not to pick between them.
 
 ### Agent eval
 
@@ -214,19 +231,44 @@ For ~20 labeled anomaly windows in the HDFS logs, a short demo ticket describes 
 | Redaction | Hits and sampled precision per detector | See below |
 | Log extraction | Log lines found in tickets | 7,670 log lines in 777 tickets (6%); exception lines in 1,770 tickets (13%) |
 | Template model | Test-ticket log lines matching a template learned from earlier tickets | 30% any template; 25% a rare template (seen in ≤20 tickets) |
-| Retrieval: dense only | Recall@5 / MRR | TBD |
-| Retrieval: BM25 only | Recall@5 / MRR | TBD |
-| Retrieval: template match only | Recall@5 / MRR | TBD |
-| Retrieval: RRF fusion | Recall@5 / MRR | TBD |
-| Retrieval: RRF + rerank | Recall@5 / MRR | TBD |
-| Retrieval by link type | Recall@5 for Reference / Regression / Problem | TBD |
-| Known-issue detection | Hits out of 21 | TBD |
+| Retrieval | Hit@5, Recall@5, MRR@10 on 163 test queries | See below |
+| Known-issue detection | Duplicate found in top 5 | **16/21** |
 | Agent: time window | Queried window overlaps the anomaly | TBD |
 | Agent: evidence | Fingerprint includes the anomalous blocks' templates | TBD |
 | Agent: cost | Tool calls, tokens, latency per ticket | TBD |
 | Diagnosis: LLM judge vs actual resolution | Agreement rate | TBD |
 | Diagnosis: hand-checked sample (n=20) | Agreement with judge | TBD |
 | Abstention | Rate, and accuracy when not abstaining | TBD |
+
+### Retrieval
+
+**Test set** (163 queries, 177 relevant links):
+
+| Method | Hit@5 | Recall@5 | MRR@10 | Reference | Regression | Problem/Incident |
+|---|---|---|---|---|---|---|
+| Dense | 0.436 | 0.419 | 0.308 | 47/100 | 9/30 | 17/47 |
+| BM25 | 0.417 | 0.405 | 0.307 | 46/100 | 8/30 | 17/47 |
+| **RRF (dense + BM25)** | **0.479** | **0.460** | **0.360** | **54/100** | 8/30 | **19/47** |
+
+Hit@5 is the share of queries with at least one linked ticket in the top 5. Recall@5 is the share of all linked tickets found in the top 5. MRR@10 rewards finding the first correct ticket early (rank 1 = 1.0, rank 2 = 0.5, ...).
+
+**Why fusion helps:** dense and BM25 find different tickets. On the test set, 20 queries were hit only by dense and 17 only by BM25; a perfect combination of the two would reach 0.540. RRF reached 0.479. Compared with dense alone it gained 16 queries and lost 9. That gain is **not statistically significant** (sign test, p = 0.23), but it's consistent across all three metrics.
+
+**Regression links are the hardest** (8–9 of 30 for every method). A regression links a symptom ("NameNode fails on startup") to the change that caused it ("refactor edit log loading"), and the two are usually described in different words.
+
+**Variants tested on dev and left out:**
+
+| Variant (dev, 160 queries) | Hit@5 | vs RRF | Decision |
+|---|---|---|---|
+| RRF | 0.575 | — | **kept** |
+| RRF, then cross-encoder rerank of the top 20 | 0.487 | 10 gained, 24 lost, **p = 0.024** | dropped: significantly worse |
+| RRF + reranker as a third vote | 0.575 | 3 gained, 3 lost, p = 1.0 | dropped: no gain at ~7× the latency |
+
+`bge-reranker-base` was trained to judge whether a passage answers a question. This task is whether a past ticket is *related* to a new one, and a related ticket rarely answers the new one. The loss was concentrated in Reference links (65% → 51% on dev), the loosest kind of relation.
+
+**Template-ID matching** was dropped from retrieval before measuring: only **3 of 163** test queries contain a log line, because bug reports describe symptoms in prose and logs get pasted later, in comments. The template model's job is summarizing live logs for the agent, where log lines number in the millions.
+
+**Known limitation:** BM25's IDF (how rare each word is) is computed over the whole corpus, including tickets after each query. That's a leak of word statistics, not of any text, and standard in retrieval evals.
 
 ### Redaction
 
@@ -275,7 +317,10 @@ triagerag/
 │   │   ├── chunk.py
 │   │   └── embed.py
 │   ├── query/             # Part 2
-│   │   ├── retrieve.py    #   dense, BM25, template match, RRF, rerank
+│   │   ├── retrieve.py    #   dense search, grouping chunks into tickets
+│   │   ├── bm25.py        #   BM25 over an in-memory inverted index
+│   │   ├── fuse.py        #   reciprocal rank fusion
+│   │   ├── rerank.py      #   cross-encoder (measured, not used)
 │   │   ├── logsource.py   #   LogSource: PastedLogSource, LokiLogSource
 │   │   ├── tools.py       #   tool definitions, LogQL validation, guardrails
 │   │   ├── agent.py       #   tool-use loop, limits, audit log
@@ -332,7 +377,7 @@ ANTHROPIC_API_KEY=...
 | 2 | Drain configuration: masking, threshold, template lookup | ✅ |
 | 3 | Jira ingestion: tickets, links, eval query sets | ✅ |
 | 4 | Redaction, cleaning, log extraction, template model from ticket logs, chunking, embedding | ✅ |
-| 5 | Hybrid retrieval, temporal filter, ablation → becomes `search_past_tickets` | ⬜ |
+| 5 | Hybrid retrieval, temporal filter, dev/test eval, reranker study | ✅ |
 | 6 | Agent loop, written by hand: tool definitions, call/result loop, limits, audit log. First with `search_past_tickets` only, on the ticket eval | ⬜ |
 | 7 | Loki: local instance, HDFS logs loaded, Loki tools and LogQL guardrails, agent eval on anomaly windows | ⬜ |
 | 8 | Diagnosis eval (LLM judge + hand check), Jira Cloud webhook and posting | ⬜ |
@@ -346,6 +391,18 @@ ANTHROPIC_API_KEY=...
 **Index every ticket type, not just fixed bugs.** Bugs link mostly to the improvements, tasks, and duplicates around them. The first corpus of 4,110 fixed bugs was missing most link targets. Widening to all 13,302 resolved tickets raised usable queries from 61 to 163, and it matches how an engineer actually searches.
 
 **Duplicate links don't work as ground truth for fixed bugs.** A fixed bug's duplicates are filed after it, so the temporal filter correctly hides them. Using them would have leaked answers. Duplicates work only in the other direction, as the known-issue slice.
+
+**Choose on dev, report on test.** Every variant was compared on a separate dev set, with the decision rule written down before seeing the result. Picking whichever variant scores best on the test set would quietly tune the system to those 163 queries.
+
+**Report significance, not just differences.** With ~160 queries, a few points of Hit@5 can be noise. Every comparison reports a sign test on the queries where the two methods disagree; RRF's gain over dense is reported as consistent but not significant.
+
+**A reranker isn't automatically an improvement.** The cross-encoder made retrieval significantly worse on dev. It was trained for question-answer relevance, and this task is ticket-to-ticket relatedness. It was measured and left out instead of included by default.
+
+**Fuse on ranks, not scores.** Cosine similarity and BM25 scores are on unrelated scales. RRF combines rank positions, which avoids having to normalize scores at all.
+
+**BM25 written by hand.** Postgres full-text ranking doesn't weight rare words above common ones, which is the core of BM25. A ~40-line implementation over an inverted index scores all 163 queries in milliseconds each.
+
+**Timestamp every chunk.** Filtering by when a ticket was resolved isn't enough, because comments keep arriving afterwards. Each chunk carries its own creation time, and retrieval filters on it.
 
 **Ground truth from engineers, not from me.** Every relevance label is an issue link Hadoop engineers created while working the tickets. I didn't author any labels.
 
