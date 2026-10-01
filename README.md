@@ -88,15 +88,27 @@ The trained model is a build artifact, versioned in `models/drain_state.bin`, so
 
 **8. Chunk.** Tickets are chunked by structure, not by fixed token windows:
 
-| Chunk | Content | Why separate |
-|-------|---------|--------------|
-| Problem | Summary + description | How the issue was reported; this is what a new ticket looks like |
-| Comment | One per substantive comment | Diagnosis happens in comments, often several replies in |
-| Resolution | Final comments + fix summary | What actually fixed it; this is what the diagnosis cites |
+| Chunk | Content | Count |
+|-------|---------|-------|
+| Problem | Summary + description | 13,528 |
+| Comment | One per substantive human comment | 89,183 |
 
-Any chunk over ~500 tokens is split on paragraph boundaries with overlap. Every chunk has the ticket summary prepended before embedding, so a comment that just says "the lease recovery never ran" still carries its ticket context. Each chunk stores its template IDs and exception classes.
+- Every chunk starts with `[HDFS-1234] summary`, so a comment that just says "the lease recovery never ran" still carries its ticket context.
+- Code blocks stay in the text but are cut to 30 lines each; a 400-line stack trace would swamp the embedding. Exception classes and template IDs are stored as metadata on the chunk.
+- Comments under 40 characters are skipped, and so are short sign-off comments (under 200 characters with commit or approval language like "+1, committed to trunk"). The sign-off filter removed 3,828 chunks.
+- Anything over ~350 words is split on paragraph boundaries, with a short overlap.
 
-**9. Embed and store.** Chunks are embedded with `bge-base-en-v1.5` and written to Postgres: the vector to a pgvector HNSW index, the text to a `tsvector` GIN index for BM25, and the template IDs to a GIN array index.
+A planned **resolution** chunk, built from each ticket's last two comments, was dropped after sampling: none of five sampled described a fix. In Apache projects the fix lives in the patch or pull request, and the last comments are usually review sign-off. For newer tickets, the GitHub PR description (posted by a bot account) is the real fix summary; it's a candidate source for a future fix section.
+
+**9. Embed and store.** 102,711 chunks are embedded with `bge-base-en-v1.5` (768 dimensions, normalized) on an Apple-silicon GPU at ~62 chunks/s, about 28 minutes in total. Embedding runs 200 tickets at a time, committing each batch, so the build is resumable and a ticket is never half-indexed. Each chunk is written to Postgres with three indexes, one per retrieval method:
+
+| Index | Column | Used by |
+|---|---|---|
+| HNSW | `embedding` | dense search |
+| GIN | `tsv` (generated `tsvector`) | BM25-style keyword search |
+| GIN | `template_ids` | template matching |
+
+The HNSW index is built once, after the bulk load, instead of being updated on every insert. Queries must use the bge query prefix (`Represent this sentence for searching relevant passages: `); documents are embedded without it.
 
 ### Part 2: Query, as an agent
 
@@ -319,7 +331,7 @@ ANTHROPIC_API_KEY=...
 | 1 | HDFS log reader | ✅ |
 | 2 | Drain configuration: masking, threshold, template lookup | ✅ |
 | 3 | Jira ingestion: tickets, links, eval query sets | ✅ |
-| 4 | Redaction ✅, cleaning ✅, log extraction ✅, template model from ticket logs ✅, chunking, embedding | 🔄 |
+| 4 | Redaction, cleaning, log extraction, template model from ticket logs, chunking, embedding | ✅ |
 | 5 | Hybrid retrieval, temporal filter, ablation → becomes `search_past_tickets` | ⬜ |
 | 6 | Agent loop, written by hand: tool definitions, call/result loop, limits, audit log. First with `search_past_tickets` only, on the ticket eval | ⬜ |
 | 7 | Loki: local instance, HDFS logs loaded, Loki tools and LogQL guardrails, agent eval on anomaly windows | ⬜ |
@@ -366,6 +378,12 @@ ANTHROPIC_API_KEY=...
 **Raw ticket JSON is stored unredacted, here only.** The `tickets.raw` column keeps the original JSON because this data is public. A production deployment would store only redacted text and leave the original in Jira.
 
 **Commenter usernames are kept.** Engineer names in internal tickets are useful context and usually not sensitive. Customer names would be. In production, name detection would allowlist the employee directory.
+
+**A chunk's label has to match its content.** The planned resolution chunk was dropped because sampled text didn't describe fixes. A label that promises more than the text contains would mislead the diagnosis step, which cites "what fixed it".
+
+**Load first, index after.** The HNSW index was dropped during the bulk load and built once at the end, with `maintenance_work_mem` raised for that session only. Updating the graph on every insert is far slower than building it in one pass.
+
+**Filtered vector search needs care.** By default, HNSW finds the nearest candidates first and applies `WHERE` filters after. With a per-query time filter, a query can get far fewer than 5 results if its nearest neighbors are newer than it. The eval uses exact search to avoid this; the live path raises `hnsw.ef_search` or uses pgvector's iterative scan.
 
 **Template match as its own retrieval signal.** Log snippets are where embeddings and keyword search both struggle. Normalizing them first, then matching on template IDs, is measured separately so its contribution shows up in the ablation.
 

@@ -1,3 +1,5 @@
+create extension if not exists vector;
+
 create table if not exists templates (
   template_id  int primary key,
   template     text not null,
@@ -31,6 +33,7 @@ create table if not exists chunks (
   section      text,                    -- description, comment, resolution
   content      text not null,
   template_ids int[],
+  exception_signatures text[] default '{}',
   embedding    vector(768),
   tsv          tsvector generated always as (to_tsvector('english', content)) stored
 );
