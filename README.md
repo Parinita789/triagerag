@@ -110,18 +110,25 @@ A planned **resolution** chunk, built from each ticket's last two comments, was 
 
 The HNSW index is built once, after the bulk load, instead of being updated on every insert. Queries must use the bge query prefix (`Represent this sentence for searching relevant passages: `); documents are embedded without it.
 
-### Part 2: Query, as an agent
+### Part 2: Query: retrieval first, then the LLM
 
-A new ticket goes through the same clean, redact, extract, and normalize steps. Then an LLM agent, in a tool-calling loop written by hand with the Anthropic SDK, decides what evidence to gather.
+A new ticket (a Jira webhook in production) goes through the same clean, redact, extract, and normalize steps. Then:
+
+1. **Retrieval runs with no LLM.** The ticket's summary and description go straight into hybrid search; the top 5 past tickets are fetched deterministically. No model decides whether or what to search; every ticket gets searched.
+2. **The LLM reads the results and writes the diagnosis.** It gets the ticket plus the top 5, and must call `submit_diagnosis`. In **pipeline mode** (`extra_calls = 0`, the default) that's one LLM call. In **hybrid mode** it may first spend up to N extra calls on its own searches or on reading a ticket in full.
+
+The loop is written by hand against an OpenAI-compatible API (OpenRouter), with no agent framework.
 
 **Tools:**
 
-| Tool | What it does | Why it's designed this way |
+| Tool | What it does | Status |
 |---|---|---|
-| `loki_labels()` | Lists queryable labels and their values | The agent can't write a correct query without knowing which components and hosts exist |
-| `log_template_stats(selector, start, end)` | Runs a LogQL query, normalizes every line, and returns templates with counts compared to a baseline: **new**, **spiking**, **error** | The key tool. The agent sees a 20-row summary instead of 50,000 raw lines: fewer tokens, far more reliable |
-| `loki_query(logql, start, end, limit)` | A few raw lines, for a closer look at one template | Capped and redacted before the agent sees them |
-| `search_past_tickets(text, template_ids, exceptions)` | Hybrid retrieval over past tickets (below) | Connects log evidence to past incidents and their fixes |
+| `search_past_tickets(query, k)` | Hybrid retrieval over past tickets (below), with a snippet from each ticket's best chunk | ✅ |
+| `get_ticket(key)` | Full text of one past ticket. Refuses the query ticket itself and anything resolved after it | ✅ |
+| `submit_diagnosis(...)` | The final answer: summary, likely cause, confidence, abstain, and cited tickets, each with a reason | ✅ |
+| `loki_labels()` | Lists queryable labels and their values | Phase 7 |
+| `log_template_stats(selector, start, end)` | Runs a LogQL query, normalizes every line, and returns templates with counts compared to a baseline: **new**, **spiking**, **error**. The agent sees a 20-row summary instead of 50,000 raw lines | Phase 7 |
+| `loki_query(logql, start, end, limit)` | A few raw lines, for a closer look at one template; capped and redacted | Phase 7 |
 
 **Retrieval** (inside `search_past_tickets`) searches only chunks written before the query ticket was created, from tickets resolved before it:
 - **Dense**: cosine similarity between the query embedding and each chunk's
@@ -133,13 +140,16 @@ A cross-encoder reranker and template-ID matching were both built and measured, 
 
 **Guardrails**, which replace the checks a human would otherwise make:
 - **Read-only.** No tool can change anything.
-- **Every LogQL query is validated before it runs:** it must have a stream selector, a time range of at most a few hours, and a line limit of at most ~500. Rejections go back to the agent with the reason, so it can fix the query.
-- **Hard limits:** at most ~6 tool calls per ticket, plus a total time and token budget. The loop always terminates.
-- **Tool errors are returned to the agent as results,** not raised. A bad query becomes `error: range exceeds 6h`, and the agent retries.
-- **Every tool result is redacted** before the agent sees it.
+- **Tool arguments are validated with Pydantic** before anything runs. Invalid arguments go back to the model as an error result, so it can fix them.
+- **Citations are checked against what the model actually saw.** A cited ticket that never appeared in a tool result is dropped. A diagnosis that doesn't abstain must cite at least one ticket, or it's rejected.
+- **Same time filter as retrieval.** `get_ticket` refuses the query ticket and anything resolved after it, so the model can't read the future.
+- **Hard limits:** `extra_calls + 3` LLM calls and 60k tokens per ticket; `max_tokens` 4096 per call, with reasoning effort set to low. The loop always terminates, with a `stopped` reason: `submitted`, `no_submit`, `budget`, or `llm_error`.
+- **Tool errors are returned to the model as results,** never raised.
+- **Every tool result is redacted** before the model sees it. *(Loki tools: Phase 7, along with LogQL validation: stream selector, bounded time range, line limit.)*
 - **Every call is logged:** tool, arguments, result size, latency. That's the audit trail.
+- **LLM calls:** 90 s timeout, retries with backoff on 429, connection errors, and 5xx, and a response cache keyed by a hash of the request, so evals resume where they stopped and reruns are free. Failed responses are never cached.
 
-**Diagnosis.** The agent writes a diagnosis that cites specific tickets and log templates. If the evidence is weak, it abstains. The diagnosis goes through `redact()` once more, since the LLM only saw pseudonyms but can still invent a plausible email or reconstruct something a detector missed. Then it's posted as a Jira comment.
+**Diagnosis.** The model writes a diagnosis that cites specific tickets, each with a reason. If the evidence is weak, it abstains. The diagnosis goes through `redact()` once more, since the LLM only saw pseudonyms but can still invent a plausible email or reconstruct something a detector missed. Then it's posted as a Jira comment (Phase 8). If the LLM fails, the retrieved tickets are still posted, without a diagnosis (Phase 8).
 
 ---
 
@@ -220,7 +230,9 @@ Variants were chosen on dev, with the decision rule written down before each run
 
 ### Agent eval
 
-For ~20 labeled anomaly windows in the HDFS logs, a short demo ticket describes the symptom. The anomaly labels come from the dataset; the ticket text is written by me, and results are reported with that caveat.
+**Ticket agent (Phase 6):** 12 dev tickets sampled with a fixed seed, run in pipeline mode and hybrid mode. It measures whether the LLM cites the linked ticket when retrieval found it, whether extra searches find linked tickets that retrieval missed, and cost and reliability.
+
+**Log agent (Phase 7):** for ~20 labeled anomaly windows in the HDFS logs, a short demo ticket describes the symptom. The anomaly labels come from the dataset; the ticket text is written by me, and results are reported with that caveat.
 
 ### Results
 
@@ -233,9 +245,11 @@ For ~20 labeled anomaly windows in the HDFS logs, a short demo ticket describes 
 | Template model | Test-ticket log lines matching a template learned from earlier tickets | 30% any template; 25% a rare template (seen in ≤20 tickets) |
 | Retrieval | Hit@5, Recall@5, MRR@10 on 163 test queries | See below |
 | Known-issue detection | Duplicate found in top 5 | **16/21** |
-| Agent: time window | Queried window overlaps the anomaly | TBD |
-| Agent: evidence | Fingerprint includes the anomalous blocks' templates | TBD |
-| Agent: cost | Tool calls, tokens, latency per ticket | TBD |
+| Ticket agent: citation | Linked ticket cited when retrieval found it (12 dev tickets) | **8/8** |
+| Ticket agent: extra searches | Linked tickets recovered that retrieval missed | **0/3** (hybrid, 8 of 12 tickets run) |
+| Ticket agent: cost | LLM calls, tokens per ticket | pipeline **1.0 / 3.1k**; hybrid 2.6 / 9.0k |
+| Log agent: time window | Queried window overlaps the anomaly | TBD |
+| Log agent: evidence | Fingerprint includes the anomalous blocks' templates | TBD |
 | Diagnosis: LLM judge vs actual resolution | Agreement rate | TBD |
 | Diagnosis: hand-checked sample (n=20) | Agreement with judge | TBD |
 | Abstention | Rate, and accuracy when not abstaining | TBD |
@@ -270,6 +284,32 @@ Hit@5 is the share of queries with at least one linked ticket in the top 5. Reca
 
 **Known limitation:** BM25's IDF (how rare each word is) is computed over the whole corpus, including tickets after each query. That's a leak of word statistics, not of any text, and standard in retrieval evals.
 
+### Ticket agent
+
+Model: `qwen/qwen3.8-27b:free` on OpenRouter (October 2026), temperature 0. 12 dev tickets, fixed seed.
+
+| Mode | Tickets | Retrieval hit (top 5) | Cited by LLM | Found by LLM, missed by retrieval | Abstained | Tool errors | LLM calls | Tokens |
+|---|---|---|---|---|---|---|---|---|
+| **Pipeline** (`extra_calls = 0`) | 12 | 8/12 | **8/12** | — | 1 | 0 | **1.0** | **3,149** |
+| Hybrid (`extra_calls = 3`) | 8 of 12* | 5/8 | 5/8 | **0/3** | 0 | 2 | 2.6 | 9,016 |
+
+\*The free model's shared pool rate-limited the run. The remaining 4 tickets contain only 1 retrieval miss, so hybrid can't reach the 2-recovery bar set before the run.
+
+**Pipeline mode is the default.** Hybrid behaved as designed: it read tickets in full, rewrote its queries, and sometimes cited extra related tickets. But it recovered none of the linked tickets that retrieval missed, at about 2.6× the calls and 2.8× the tokens. With 3 misses to recover and a 27B model, this is a small sample, not a general verdict on agentic retrieval.
+
+**The LLM never lost a hit:** whenever retrieval found the linked ticket, the LLM cited it. The one abstention was on a ticket where retrieval had missed. In pipeline mode the LLM can only cite what retrieval found, so citation quality is capped by retrieval; diagnosis quality itself is measured in Phase 8.
+
+**Bugs found by the eval:**
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| 0 of 6 cited, while retrieval hit 4 | The model listed tickets in its prose and left `related_tickets` empty | `related_tickets` made required in the schema; a validator rejects a non-abstaining diagnosis with no citations |
+| 2 of 9 tickets hit the 60k token budget; 8 tool errors; 15.9k tokens per ticket | Runaway reasoning: one call had a 956-token prompt and generated 59,901 tokens of reasoning before the provider killed it. The failed response was also cached | `max_tokens` 4096 and reasoning effort low; failed responses no longer cached. Result: 0 tool errors, 1.0 calls and 3.1k tokens per ticket, a 5× cost cut |
+| `submit_diagnosis({})` called with empty arguments | A model quirk: its own reasoning said "I need to actually fill in the parameters", then it sent `{}` again (10 cached cases) | The validator catches every case, and the model succeeds on the next call. A specific error message for empty arguments |
+| Eval appeared stuck | Free-tier 429s from the model's shared upstream pool | Retries with backoff; the cache lets a stopped eval resume |
+
+**Known limitations:** free OpenRouter endpoints may log prompts (acceptable for public Apache data, not for private tickets). Free-tier limits are 20 requests/min and 50/day under $10 of credit, and shared upstream pools return 429 regardless.
+
 ### Redaction
 
 Measured on all 12,788 ticket descriptions (9.4 MB). Precision was estimated by reading a random sample of hits for each detector, then fixing the detector and measuring again.
@@ -296,7 +336,7 @@ Across descriptions and comments together: 759 emails and 2 credentials redacted
 - **Loki**: log storage and LogQL, run locally in Docker
 - **Drain3**: log template mining
 - **sentence-transformers**: `BAAI/bge-base-en-v1.5` embeddings, `bge-reranker-base` cross-encoder
-- **Anthropic SDK**: hand-written tool-use loop, diagnosis, LLM-judge eval
+- **OpenRouter** via the `openai` SDK: hand-written tool-calling loop and diagnosis (model: `qwen/qwen3.8-27b:free`)
 - **httpx**, **psycopg**, **pydantic**, **pytest**
 
 ---
@@ -321,9 +361,11 @@ triagerag/
 │   │   ├── bm25.py        #   BM25 over an in-memory inverted index
 │   │   ├── fuse.py        #   reciprocal rank fusion
 │   │   ├── rerank.py      #   cross-encoder (measured, not used)
-│   │   ├── logsource.py   #   LogSource: PastedLogSource, LokiLogSource
-│   │   ├── tools.py       #   tool definitions, LogQL validation, guardrails
-│   │   ├── agent.py       #   tool-use loop, limits, audit log
+│   │   ├── search.py      #   SearchService: RRF search + get_ticket, time-filtered
+│   │   ├── llm.py         #   OpenRouter client: timeout, retries, response cache
+│   │   ├── logsource.py   #   LogSource: PastedLogSource, LokiLogSource (Phase 7)
+│   │   ├── tools.py       #   tool schemas, Pydantic validation, citation check
+│   │   ├── agent.py       #   retrieval first, then the LLM loop; limits, audit log
 │   │   └── post.py        #   Jira comment
 │   └── eval/              # retrieval, agent, and diagnosis evaluation
 ├── models/
@@ -363,7 +405,14 @@ The trained template model is committed in `models/`, so retraining is only need
 ```
 DATABASE_URL=postgresql://postgres:dev@localhost:5433/triagerag
 LOKI_URL=http://localhost:3100
-ANTHROPIC_API_KEY=...
+OPENROUTER_API_KEY=...
+OPENROUTER_MODEL=qwen/qwen3.8-27b:free
+```
+
+Run the agent:
+```bash
+uv run python scripts/run_agent.py HDFS-11445 --extra-calls 0   # one ticket, with trace
+uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets
 ```
 
 ---
@@ -378,7 +427,7 @@ ANTHROPIC_API_KEY=...
 | 3 | Jira ingestion: tickets, links, eval query sets | ✅ |
 | 4 | Redaction, cleaning, log extraction, template model from ticket logs, chunking, embedding | ✅ |
 | 5 | Hybrid retrieval, temporal filter, dev/test eval, reranker study | ✅ |
-| 6 | Agent loop, written by hand: tool definitions, call/result loop, limits, audit log. First with `search_past_tickets` only, on the ticket eval | ⬜ |
+| 6 | Retrieval first, then an LLM loop written by hand: tools, validation, citation check, limits, audit log, pipeline vs hybrid eval | ✅ |
 | 7 | Loki: local instance, HDFS logs loaded, Loki tools and LogQL guardrails, agent eval on anomaly windows | ⬜ |
 | 8 | Diagnosis eval (LLM judge + hand check), Jira Cloud webhook and posting | ⬜ |
 
@@ -412,7 +461,17 @@ ANTHROPIC_API_KEY=...
 
 **Guardrails in code, not in the prompt.** Query validation, time-range and line limits, a tool-call budget, and redaction of every tool result are enforced by the tool layer. A prompt can ask the agent to behave; only code can guarantee it.
 
-**The agent loop is written by hand.** Tool definitions, the call/result loop, retries, and limits use the Anthropic SDK directly, with no agent framework, so every step is visible and debuggable.
+**The agent loop is written by hand.** Tool definitions, the call/result loop, retries, and limits use the OpenAI-compatible API directly, with no agent framework, so every step is visible and debuggable.
+
+**Retrieval doesn't wait for an LLM.** The webhook triggers retrieval directly. A first LLM call only to decide "search for this ticket" adds cost and latency and a way to fail, for a decision that is always yes. The LLM comes in afterwards, to read the results and diagnose.
+
+**Pipeline mode by default; agentic search had to earn its place.** Hybrid mode was measured against the one-call pipeline on the same tickets, with a recovery bar set before the run. It cost about 3× as much and recovered nothing, so it's off by default.
+
+**Cap the reasoning, not only the loop.** A call budget doesn't stop a single call from generating 60k tokens of reasoning. `max_tokens` and a low reasoning effort cut cost 5× and removed every tool error in the eval.
+
+**Validate citations in code.** A prompt asking for citations wasn't enough: the model named tickets in prose and left the structured field empty. The schema requires citations unless the model abstains, and cited tickets must have appeared in a tool result.
+
+**Never cache a failure.** The response cache makes evals resumable and reruns free, but a cached error replays forever. Only successful responses are stored.
 
 **Train templates on the tickets' own logs.** The 2008 cluster covers one component set in one version; the tickets span 19 years of HDFS. Templates are learned from log lines in index tickets resolved before the cutoff, which mirrors training on the logs of the systems the tickets are about. The HDFS logs validated the Drain configuration: 31 templates, 29 matching the ground truth one to one.
 
