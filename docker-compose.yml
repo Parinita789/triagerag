@@ -6,6 +6,15 @@ services:
       POSTGRES_DB: triagerag
     ports: ["5433:5432"]
     volumes: ["pgdata:/var/lib/postgresql/data"]
+  loki:
+    image: grafana/loki:3.5.0
+    command: -config.file=/etc/loki/config.yml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./loki-config.yml:/etc/loki/config.yml:ro
+      - loki-data:/loki  
 
 volumes:
   pgdata:
+  loki-data:

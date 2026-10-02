@@ -4,23 +4,15 @@ from dataclasses import dataclass, field
 from openai import OpenAIError
 
 from triagerag.query.llm import LLMClient
-from triagerag.query.tools import TOOLS, DiagnosisArgs, ToolContext, TraceEvent, execute
+from triagerag.query.tools import (LOG_TOOLS, TICKET_TOOLS, DiagnosisArgs, ToolContext, TraceEvent,
+                                   execute)
 
 INITIAL_K = 5
 MAX_TOKENS = 60_000
-SUBMIT_ONLY = [t for t in TOOLS if t["function"]["name"] == "submit_diagnosis"]
-
-MAX_TICKET_CHARS = 8_000  # ~2k tokens
-
-def _clip(text: str) -> str:
-    if len(text) <= MAX_TICKET_CHARS:
-        return text
-    head = text[: MAX_TICKET_CHARS - 1_000]
-    tail = text[-1_000:]
-    return f"{head}\n...[truncated {len(text) - MAX_TICKET_CHARS} chars]...\n{tail}"
+TICKET_SUBMIT_ONLY = [t for t in TICKET_TOOLS if t["function"]["name"] == "submit_diagnosis"]
 
 
-def _system_prompt(extra_calls: int) -> str:
+def _ticket_prompt(extra_calls: int) -> str:
     prompt = """You are an experienced HDFS engineer triaging a newly filed bug report.
 You are given the report and the results of a search for related past tickets.
 - Cite only tickets that appear in results you were given. Never invent ticket keys.
@@ -35,37 +27,36 @@ You are given the report and the results of a search for related past tickets.
     return prompt
 
 
+def _log_prompt(max_queries: int) -> str:
+    return f"""You are an experienced HDFS engineer investigating a report about one block,
+using the cluster's logs. Log times are UTC.
+- Start with log_template_stats for the block_id, over a range around the reported time
+  (for example 1 hour before to 1 hour after).
+- If the result says the block's write-path lines are not in range, query again around when the
+  block was written before concluding anything is missing.
+- Weigh the evidence. Exceptions, errors and MISSING write-path lines are strong evidence.
+  RARE only means uncommon: some rare lines record routine recovery work and also appear on
+  healthy blocks, so a rare line alone is weak evidence.
+- A block whose lifecycle looks normal gets anomaly_found=false. That is a valid answer.
+- Use confidence=high only for clear exceptions/errors or missing lines.
+- You have at most {max_queries} log tool calls; then call submit_diagnosis exactly once."""
+
+
 @dataclass
 class AgentResult:
     diagnosis: DiagnosisArgs | None
     stopped: str            # submitted | no_submit | budget | llm_error
     related: list[str]      # top tickets from the automatic search: postable even with no diagnosis
     llm_calls: int
-    extra_calls: int        # searches and reads the model chose to make
+    extra_calls: int        # tool calls the model chose to make
     tokens: int
     trace: list[TraceEvent] = field(default_factory=list)
     error: str | None = None
 
 
-def run_agent(ticket_text: str, ctx: ToolContext, llm: LLMClient, extra_calls: int = 3) -> AgentResult:
-    # 1. Retrieval: RRF on the ticket text. No LLM.
-    results = execute("search_past_tickets",
-                      json.dumps({"query": ticket_text[:500], "k": INITIAL_K}), ctx)[0]
-    related = list(ctx.last_search)
-
-    # 2. The LLM reads the ticket + results.
-    tools = TOOLS if extra_calls else SUBMIT_ONLY
+def _loop(messages: list[dict], tools: list[dict], ctx: ToolContext, llm: LLMClient,
+          extra_calls: int, related: list[str]) -> AgentResult:
     allowed = {t["function"]["name"] for t in tools}
-    instruction = ("If these explain the failure, submit your diagnosis. If they look weak or unrelated, "
-                   "search again with different words or read a ticket first."
-                   if extra_calls else "Write your diagnosis from these results.")
-    messages: list[dict] = [
-        {"role": "system", "content": _system_prompt(extra_calls)},
-        {"role": "user", "content": f"New ticket:\n\n{ticket_text}\n\n"
-                                    f"Related past tickets (search on the ticket text):\n\n{results}\n\n"
-                                    f"{instruction}"},
-    ]
-
     llm_calls = used = tokens = 0
     nudged = False
 
@@ -115,3 +106,32 @@ def run_agent(ticket_text: str, ctx: ToolContext, llm: LLMClient, extra_calls: i
 
         if llm_calls > extra_calls + 3:
             return done(None, "budget")
+
+
+def run_agent(ticket_text: str, ctx: ToolContext, llm: LLMClient, extra_calls: int = 3) -> AgentResult:
+    """Jira ticket: retrieval first (no LLM), then the LLM diagnoses."""
+    results = execute("search_past_tickets",
+                      json.dumps({"query": ticket_text[:500], "k": INITIAL_K}), ctx)[0]
+    related = list(ctx.last_search)
+
+    tools = TICKET_TOOLS if extra_calls else TICKET_SUBMIT_ONLY
+    instruction = ("If these explain the failure, submit your diagnosis. If they look weak or unrelated, "
+                   "search again with different words or read a ticket first."
+                   if extra_calls else "Write your diagnosis from these results.")
+    messages: list[dict] = [
+        {"role": "system", "content": _ticket_prompt(extra_calls)},
+        {"role": "user", "content": f"New ticket:\n\n{ticket_text}\n\n"
+                                    f"Related past tickets (search on the ticket text):\n\n{results}\n\n"
+                                    f"{instruction}"},
+    ]
+    return _loop(messages, tools, ctx, llm, extra_calls, related)
+
+
+def run_log_agent(ticket_text: str, ctx: ToolContext, llm: LLMClient, max_queries: int = 4) -> AgentResult:
+    """Ticket whose evidence is in the logs: no ticket retrieval; the LLM investigates with log tools."""
+    messages: list[dict] = [
+        {"role": "system", "content": _log_prompt(max_queries)},
+        {"role": "user", "content": f"New ticket:\n\n{ticket_text}\n\n"
+                                    "Investigate with the log tools, then call submit_diagnosis."},
+    ]
+    return _loop(messages, LOG_TOOLS, ctx, llm, max_queries, related=[])

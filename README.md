@@ -18,8 +18,9 @@ INDEXING (offline, run once, then incrementally)
                                                                                                     │
 QUERY (online, per new ticket)                                                                      │
   New ticket ──→ same clean / redact / extract / normalize                                          │
-             ──→ LLM agent, with tools:                                                             │
-                   loki_labels · log_template_stats · loki_query · search_past_tickets ◀────────────┘
+             ──→ ticket about past incidents:  search_past_tickets (no LLM) ──→ LLM ◀───────────────┘
+             ──→ ticket about live behaviour:  LLM with log tools:
+                   loki_labels · log_template_stats · log_lines   (Loki ──→ Drain templates vs baseline)
              ──→ diagnosis (cited, or abstain) ──→ redact output ──→ post to Jira
 ```
 
@@ -126,9 +127,13 @@ The loop is written by hand against an OpenAI-compatible API (OpenRouter), with 
 | `search_past_tickets(query, k)` | Hybrid retrieval over past tickets (below), with a snippet from each ticket's best chunk | ✅ |
 | `get_ticket(key)` | Full text of one past ticket. Refuses the query ticket itself and anything resolved after it | ✅ |
 | `submit_diagnosis(...)` | The final answer: summary, likely cause, confidence, abstain, and cited tickets, each with a reason | ✅ |
-| `loki_labels()` | Lists queryable labels and their values | Phase 7 |
-| `log_template_stats(selector, start, end)` | Runs a LogQL query, normalizes every line, and returns templates with counts compared to a baseline: **new**, **spiking**, **error**. The agent sees a 20-row summary instead of 50,000 raw lines | Phase 7 |
-| `loki_query(logql, start, end, limit)` | A few raw lines, for a closer look at one template; capped and redacted | Phase 7 |
+| `loki_labels()` | Components and levels you can filter on, and the time span the logs cover | ✅ |
+| `log_template_stats(start, end, block_id?, contains?, component?, level?)` | Fetches matching lines from Loki, matches each to a Drain template, and returns templates rarest first, each with the share of blocks that normally contain it (**RARE** under 2%). With `block_id`, also lists expected write-path templates that are **MISSING**. A 10-row summary instead of hundreds of raw lines | ✅ |
+| `log_lines(start, end, ..., limit)` | Up to 50 raw lines, redacted, for context on one template | ✅ |
+
+**The agent never writes LogQL.** It passes structured parameters and the code builds the query. A 27B model writing raw LogQL fails in many small ways, each of which would need its own validation rule. With structured parameters there are only values to check, injection isn't possible, and every query has a selector and a bounded range by construction. The trade-off: the agent can only ask what the parameters allow, which is enough for triage.
+
+Log tickets skip the automatic ticket retrieval. "Problems with block X" retrieves noise from Jira, so the agent starts with the logs instead.
 
 **Retrieval** (inside `search_past_tickets`) searches only chunks written before the query ticket was created, from tickets resolved before it:
 - **Dense**: cosine similarity between the query embedding and each chunk's
@@ -145,7 +150,9 @@ A cross-encoder reranker and template-ID matching were both built and measured, 
 - **Same time filter as retrieval.** `get_ticket` refuses the query ticket and anything resolved after it, so the model can't read the future.
 - **Hard limits:** `extra_calls + 3` LLM calls and 60k tokens per ticket; `max_tokens` 4096 per call, with reasoning effort set to low. The loop always terminates, with a `stopped` reason: `submitted`, `no_submit`, `budget`, or `llm_error`.
 - **Tool errors are returned to the model as results,** never raised.
-- **Every tool result is redacted** before the model sees it. *(Loki tools: Phase 7, along with LogQL validation: stream selector, bounded time range, line limit.)*
+- **Log queries are bounded in code:** at most 6 hours, at most 4,000 lines (otherwise an error asks the agent to narrow the query), component and level checked against the values Loki actually has, and text filters free of quote characters. A block filter is a regex, `blk_-123([^0-9]|$)`, because a substring match on `blk_-123` would also pull in `blk_-1234...` and mix other blocks' lines into the evidence.
+- **Template citations are checked like ticket citations:** a cited template must have appeared in a log tool result. After uncited citations are removed, the diagnosis is validated again, so one whose citations were all invented is rejected instead of passing with an empty list.
+- **Every tool result is redacted** before the model sees it. `redact()` doesn't treat IP addresses as sensitive, and the log agent's diagnoses quote DataNode IPs. That's fine for this public data; for a private cluster, whether hostnames and IPs count as sensitive is a policy decision.
 - **Every call is logged:** tool, arguments, result size, latency. That's the audit trail.
 - **LLM calls:** 90 s timeout, retries with backoff on 429, connection errors, and 5xx, and a response cache keyed by a hash of the request, so evals resume where they stopped and reruns are free. Failed responses are never cached.
 
@@ -165,13 +172,20 @@ class LogSource(Protocol):
 | `PastedLogSource` | Log lines pasted into the ticket | **The retrieval eval**, on real Apache tickets |
 | `LokiLogSource` | LogQL queries by the agent, over a time window | **The agent eval and demo**, on real HDFS cluster logs |
 
-**Why two sources:** no public dataset has tickets and logs from the same system at the same time. The Apache tickets come from the whole Hadoop community over 19 years; the HDFS logs come from one cluster over 38 hours in 2008. So the ticket eval uses the logs people pasted into tickets, and the Loki path is shown on real, time-consistent cluster logs with demo tickets written for labeled anomaly windows. Everything after the `LogSource` is the same code.
+**Why two sources:** no public dataset has tickets and logs from the same system at the same time. The Apache tickets come from the whole Hadoop community over 19 years; the HDFS logs come from one cluster over 38 hours in 2008. So the ticket eval uses the logs people pasted into tickets, and the Loki path is evaluated on real, time-consistent cluster logs, with demo tickets about labeled blocks. Everything after the `LogSource` is the same code.
 
 **How this looks in production:** each ticket would get a log fingerprint from Loki when it's created (the ticket's service and time window, normalized to templates, compared to a baseline) and the fingerprint would be stored on the ticket. It has to be stored at that moment, because Loki keeps logs for a limited time: a year-old ticket has no logs left to query, only its saved fingerprint.
 
-**Loki setup notes:**
-- Loki rejects old timestamps by default. The 2008 logs need `reject_old_samples: false` in `limits_config`.
-- Labels are `component`, `level`, and `host` (~200 values). Block ID is deliberately **not** a label: 575,000 values would create 575,000 streams. Block IDs are searched with a line filter, `|= "blk_..."`, instead.
+**Loki setup notes:** loading 2008 logs into Loki 3.5 hits several defaults built for live logs.
+- **`schema_config.from` must be before the data.** Loki rejects any line older than the first schema period. Example configs use a recent date, which silently rejects 2008 data.
+- **`reject_old_samples: false`**, and ingestion rate limits raised from 4 MB/s to 64 MB/s for the bulk load.
+- **Flush after loading.** Lines stay in the ingester's memory for up to 2 hours, and Loki only asks ingesters about recent time ranges. A 2008 query looked only in storage and came back empty until `POST /flush` wrote everything there.
+- **Never reload flushed data into the same volume.** A test load of 200k lines followed by the full load left 83,594 duplicate lines in the 3 streams the test had covered: Loki only rejects a duplicate of the last line still in memory. Reloads start from an empty volume.
+- **Turn off Loki's automatic labels** (`discover_service_name: []`, `discover_log_levels: false`), or every stream also gets `service_name` and `detected_level`.
+- **Labels are `component` and `level` only.** HDFS v1 lines carry date, time, thread ID, level and component, and no host. The IPs in a message are the two ends of a transfer, not the machine writing the line. Block ID is deliberately not a label either: 575,000 values would create 575,000 streams.
+- **Unique timestamps.** Each line gets `second × 10⁹ + its position within that second`, so lines keep file order and identical lines in the same second aren't dropped as duplicates.
+
+Result: all **11,175,629 lines in 106 seconds, 14 streams, 0 rejected**. A per-stream count in LogQL matches the file exactly.
 
 ---
 
@@ -232,7 +246,7 @@ Variants were chosen on dev, with the decision rule written down before each run
 
 **Ticket agent (Phase 6):** 12 dev tickets sampled with a fixed seed, run in pipeline mode and hybrid mode. It measures whether the LLM cites the linked ticket when retrieval found it, whether extra searches find linked tickets that retrieval missed, and cost and reliability.
 
-**Log agent (Phase 7):** for ~20 labeled anomaly windows in the HDFS logs, a short demo ticket describes the symptom. The anomaly labels come from the dataset; the ticket text is written by me, and results are reported with that caveat.
+**Log agent (Phase 7):** 23 tickets about single HDFS blocks, normal and anomalous mixed together, all with the same wording ("problems with block X around time T"). See [Log agent](#log-agent) below.
 
 ### Results
 
@@ -248,8 +262,8 @@ Variants were chosen on dev, with the decision rule written down before each run
 | Ticket agent: citation | Linked ticket cited when retrieval found it (12 dev tickets) | **8/8** |
 | Ticket agent: extra searches | Linked tickets recovered that retrieval missed | **0/3** (hybrid, 8 of 12 tickets run) |
 | Ticket agent: cost | LLM calls, tokens per ticket | pipeline **1.0 / 3.1k**; hybrid 2.6 / 9.0k |
-| Log agent: time window | Queried window overlaps the anomaly | TBD |
-| Log agent: evidence | Fingerprint includes the anomalous blocks' templates | TBD |
+| Log agent: anomalous blocks | Flagged, citing a template the block really has (13) | TBD |
+| Log agent: normal blocks | Cleared without a false alarm (10, 5 of them with rare replication lines) | TBD |
 | Diagnosis: LLM judge vs actual resolution | Agreement rate | TBD |
 | Diagnosis: hand-checked sample (n=20) | Agreement with judge | TBD |
 | Abstention | Rate, and accuracy when not abstaining | TBD |
@@ -310,6 +324,42 @@ Model: `qwen/qwen3.8-27b:free` on OpenRouter (October 2026), temperature 0. 12 d
 
 **Known limitations:** free OpenRouter endpoints may log prompts (acceptable for public Apache data, not for private tickets). Free-tier limits are 20 requests/min and 50/day under $10 of credit, and shared upstream pools return 429 regardless.
 
+### Log agent
+
+**There are no anomaly windows.** The plan was to write demo tickets for labeled anomaly windows and check whether the agent queried the right one. The labels are per block, though, and measured per hour, every hour of the 38 is 1–6% anomalous: hundreds of anomalous blocks an hour, no hour standing out. A "did it find the window" eval couldn't fail, so it would measure nothing. The eval is per block instead, the way real incident tickets name an ID (a request, a trace, here a block).
+
+**There are no ERROR lines.** All 11M lines are INFO or WARN. Grepping for errors finds nothing; anomalies show up as rare templates, or as lines that should be there and aren't.
+
+**Template model for the cluster.** A second Drain model, `models/drain_hdfs.bin`, is trained on the cluster's own logs: 31 templates, the same as the ground-truth check. The ticket model (trained on log lines pasted into tickets, from many Hadoop versions) matched only about 30% of later ticket logs and would leave most of these lines unmatched. Each log source gets its own template model. The tool's baseline, the share of blocks containing each template, is computed without labels.
+
+**Signature templates, for scoring only.** From the labels: templates where most blocks containing them are anomalous. The agent and its tools never see these.
+
+| | Templates | Examples | Anomalous share |
+|---|---|---|---|
+| Strong | 11 | `writeBlock <BLK> received exception <EXC>`, `Unexpected error trying to delete block <BLK>. BlockInfo not found in volumeMap`, `Redundant addStoredBlock request`, `Receiving empty packet for block` | ≥ 95% |
+| Weak | 6 | `ask <IP> to replicate <BLK>`, `Transmitted block <BLK>`: re-replication, mostly a reaction to failure but also routine | 66–74% |
+
+- **82.5% of anomalous blocks** (13,888 of 16,838) contain a signature. The weak replication templates also appear in 2,010 normal blocks, which is why RARE alone isn't proof.
+- **Missing lines are a perfect signal for 6,181 blocks.** `PacketResponder ... terminating` is in 568,880 of 575,061 blocks, and every block without it is anomalous. A check for templates that are *present* can't see this, so the tool also reports expected write-path templates that are MISSING.
+- **Some anomalies hide in the parameters.** The first anomalous block in the file has a perfect template lifecycle (3 of each write line), but its data went to one set of DataNodes while the NameNode registered a different set. The `<IP>` mask removes exactly that detail. Template analysis catches anomalies that change which events happen or how many; anomalies in values like host or size need a different check.
+
+**Eval set** (`scripts/build_log_eval.py`, fixed seed, block lists sorted before sampling because Python randomizes set order per run):
+
+| Group | Count | Correct if |
+|---|---|---|
+| Anomalous, strong signature (8 different signature types) | 10 | `anomaly_found` true, citing a strong signature the block has |
+| Anomalous, missing write lines only | 3 | `anomaly_found` true, citing a missing write template |
+| Normal, with replication lines | 5 | `anomaly_found` false, or true citing only weak templates at low confidence |
+| Normal, plain | 5 | `anomaly_found` false |
+
+The ticket time is when the first signature line appeared, which is when someone would notice. For `BlockInfo not found` that can be hours after the block was written, so the agent has to decide whether to look further back. Every ticket uses the same wording, so the agent has to work out which case it's in.
+
+**Prompt disclosure:** the log prompt says "some rare lines record routine recovery work and also appear on healthy blocks". That's knowledge an HDFS engineer would have, but here it was learned from the labels, and it helps on the normal-replication blocks. An ablation without that line is a planned follow-up.
+
+**First traces:** L02 (anomalous, exception) cited the exception and all three missing write lines, with a coherent cause: the stream read failed, so the write never completed or registered. L03 (normal, with replication) called the replication routine recovery and returned `anomaly_found=false`. L02 also sent `submit_diagnosis({})` three times in a row, the same empty-arguments quirk as in Phase 6, using 6 of its 7 allowed calls.
+
+**Results:** TBD, run pending (free-tier daily limit).
+
 ### Redaction
 
 Measured on all 12,788 ticket descriptions (9.4 MB). Precision was estimated by reading a random sample of hits for each detector, then fixing the detector and measuring again.
@@ -363,13 +413,15 @@ triagerag/
 │   │   ├── rerank.py      #   cross-encoder (measured, not used)
 │   │   ├── search.py      #   SearchService: RRF search + get_ticket, time-filtered
 │   │   ├── llm.py         #   OpenRouter client: timeout, retries, response cache
-│   │   ├── logsource.py   #   LogSource: PastedLogSource, LokiLogSource (Phase 7)
+│   │   ├── logs.py        #   Loki tools: structured params -> LogQL, Drain templates vs baseline
 │   │   ├── tools.py       #   tool schemas, Pydantic validation, citation check
 │   │   ├── agent.py       #   retrieval first, then the LLM loop; limits, audit log
 │   │   └── post.py        #   Jira comment
 │   └── eval/              # retrieval, agent, and diagnosis evaluation
 ├── models/
-│   └── drain_state.bin    # trained template model, versioned in git
+│   ├── drain_state.bin             # template model trained on ticket logs, versioned in git
+│   ├── drain_hdfs.bin              # template model trained on the HDFS cluster logs
+│   └── hdfs_template_baseline.json # share of blocks containing each template (no labels)
 ├── scripts/               # entrypoints: fetch_jira.py, load_jira.py, train_drain.py,
 │                          #   bench_redact.py, inspect_redact.py, check_clean.py, ...
 ├── tests/
@@ -398,6 +450,16 @@ mkdir -p data && cd data
 curl -L "https://zenodo.org/records/8196385/files/HDFS_v1.zip?download=1" -o HDFS_v1.zip
 unzip HDFS_v1.zip && cd ..
 ```
+
+Logs into Loki, then the cluster template model and the log eval set:
+```bash
+uv run python scripts/load_loki.py          # 11M lines, ~2 min; flushes to storage at the end
+uv run python scripts/loki_count.py         # per-stream counts should match the loader's
+uv run python scripts/hdfs_signatures.py    # drain_hdfs.bin, baseline, signatures (~80 s)
+uv run python scripts/build_log_eval.py     # data/eval/log_tickets.json
+uv run python scripts/eval_log_agent.py --id L02   # one ticket, with trace
+```
+To reload Loki, remove the volume first (`docker compose rm -sf loki && docker volume rm triagerag_loki-data`); loading flushed data a second time creates duplicates.
 
 The trained template model is committed in `models/`, so retraining is only needed after changing the masking rules or the threshold.
 
@@ -428,7 +490,7 @@ uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets
 | 4 | Redaction, cleaning, log extraction, template model from ticket logs, chunking, embedding | ✅ |
 | 5 | Hybrid retrieval, temporal filter, dev/test eval, reranker study | ✅ |
 | 6 | Retrieval first, then an LLM loop written by hand: tools, validation, citation check, limits, audit log, pipeline vs hybrid eval | ✅ |
-| 7 | Loki: local instance, HDFS logs loaded, Loki tools and LogQL guardrails, agent eval on anomaly windows | ⬜ |
+| 7 | Loki: 11M HDFS lines loaded, cluster template model, signature analysis, log tools with structured parameters, block-level eval set | 🔄 eval run pending |
 | 8 | Diagnosis eval (LLM judge + hand check), Jira Cloud webhook and posting | ⬜ |
 
 ---
@@ -457,7 +519,17 @@ uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets
 
 **Don't embed raw logs.** Logs are huge, highly repetitive (11M HDFS lines collapse into 31 templates), and triage questions are about time, counts, exact IDs, and absence, which LogQL answers directly and vector similarity can't. The vector index holds tickets. Logs contribute template IDs and exception classes as chunk metadata, and live evidence comes from LogQL.
 
-**Give the agent high-level tools, not raw access.** `log_template_stats` returns templates with counts against a baseline, not raw lines. An agent handed 50,000 lines drowns in them; an agent handed a 20-row summary sees the anomaly.
+**Give the agent high-level tools, not raw access.** `log_template_stats` returns templates with counts against a baseline, not raw lines. An agent handed 50,000 lines drowns in them; an agent handed a 10-row summary sees the anomaly.
+
+**Structured parameters, not model-written LogQL.** The code builds every query from a few validated values. See Part 2.
+
+**Check the eval's premise before building it.** "Find the anomaly window" sounded right, but a one-minute measurement showed every hour is 1–6% anomalous. Without that check, the eval would have produced a number that measured nothing.
+
+**Absence is evidence.** A third of the anomalous blocks are visible only through a missing line. Keyword search, embeddings, and "show me the rare templates" all miss them; a lifecycle check against what nearly every block contains finds them.
+
+**One template model per log source.** Ticket logs span 19 years of Hadoop versions; the cluster logs are one version. Each gets its own model, and the tool's baseline is computed from the cluster's own logs, without labels.
+
+**Rare isn't the same as wrong.** Re-replication templates are under 1% of blocks but a third of the time they're routine. The eval includes normal blocks with these lines, so an agent that calls every rare line the cause gets marked as a false alarm.
 
 **Guardrails in code, not in the prompt.** Query validation, time-range and line limits, a tool-call budget, and redaction of every tool result are enforced by the tool layer. A prompt can ask the agent to behave; only code can guarantee it.
 
