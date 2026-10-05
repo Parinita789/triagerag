@@ -8,6 +8,8 @@ class Settings(BaseSettings):
     openrouter_api_key: str = ""
     openrouter_model: str = ""
     data_dir: Path = Path(__file__).resolve().parents[2] / "data"
+    jira_webhook_secret: str = ""
+    judge_model: str = ""
 
 
 settings = Settings()

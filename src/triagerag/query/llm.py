@@ -4,7 +4,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError
+from openai import APIConnectionError, APIStatusError, OpenAI, RateLimitError, OpenAIError
+
+class EmptyResponseError(OpenAIError):
+    """HTTP 200 but no choices: the provider failed upstream."""
 
 CACHE_DIR = Path("data/llm_cache")
 BASE_URL = "https://openrouter.ai/api/v1"
@@ -35,6 +38,8 @@ class LLMClient:
         for attempt in range(1, 5):
             try:
                 data = self.client.chat.completions.create(**payload).model_dump()
+                if not data.get("choices"):
+                    raise EmptyResponseError(str(data.get("error") or "no choices in response")[:200])
                 if data["choices"][0].get("finish_reason") != "error":
                     path.write_text(json.dumps(data))
                 return data  # finish_reason == "error": returned but not cached

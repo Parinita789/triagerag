@@ -156,7 +156,25 @@ A cross-encoder reranker and template-ID matching were both built and measured, 
 - **Every call is logged:** tool, arguments, result size, latency. That's the audit trail.
 - **LLM calls:** 90 s timeout, retries with backoff on 429, connection errors, and 5xx, and a response cache keyed by a hash of the request, so evals resume where they stopped and reruns are free. Failed responses are never cached.
 
-**Diagnosis.** The model writes a diagnosis that cites specific tickets, each with a reason. If the evidence is weak, it abstains. The diagnosis goes through `redact()` once more, since the LLM only saw pseudonyms but can still invent a plausible email or reconstruct something a detector missed. Then it's posted as a Jira comment (Phase 8). If the LLM fails, the retrieved tickets are still posted, without a diagnosis (Phase 8).
+**Diagnosis.** The model writes a diagnosis that cites specific tickets, each with a reason. If the evidence is weak, it abstains. The diagnosis goes through `redact()` once more, since the LLM only saw pseudonyms but can still invent a plausible email or reconstruct something a detector missed. The result becomes a Jira comment. If the LLM fails, the comment still lists the retrieved tickets.
+
+### Part 3: The service
+
+```
+Jira ──webhook──▶ FastAPI: verify signature ─▶ insert job (once per issue) ─▶ 202 in ms
+                                                        │
+                                       Postgres table triage_jobs (the queue)
+                                                        │
+                  worker: claim job (FOR UPDATE SKIP LOCKED) ─▶ retrieval ─▶ LLM ─▶ redact ─▶ comment
+```
+
+- **Signature check over the raw bytes**, compared in constant time. Re-serializing the JSON first would change the bytes and fail every real webhook.
+- **Idempotent:** the issue key is the primary key and the insert uses `on conflict do nothing`. A Jira retry gets `200 duplicate` instead of a second comment.
+- **Redacted at ingestion**, so the queue table never holds raw secrets.
+- **Return fast, work later.** The receiver answers in milliseconds; retrieval and the LLM take 10–60 s in a separate worker.
+- **Postgres as the queue**, not in-process background tasks, which a crash or restart would lose. `FOR UPDATE SKIP LOCKED` lets several workers run without ever claiming the same job. A job left `running` by a dead worker goes back to the queue after 10 minutes, or to `failed` after 3 attempts.
+- **Graceful degradation:** when the LLM is down or over budget, the comment still lists the 5 related tickets, since retrieval needs no LLM. Tested end to end with the daily quota exhausted.
+- **Jira posting** is the remaining piece: a dry-run poster stores the comment in `triage_jobs.comment`; a real poster against a mocked Jira API is planned. It hasn't been run against a live Jira site.
 
 ---
 
@@ -264,9 +282,9 @@ Variants were chosen on dev, with the decision rule written down before each run
 | Ticket agent: cost | LLM calls, tokens per ticket | pipeline **1.0 / 3.1k**; hybrid 2.6 / 9.0k |
 | Log agent: anomalous blocks | Flagged, citing a template the block really has (13) | TBD |
 | Log agent: normal blocks | Cleared without a false alarm (10, 5 of them with rare replication lines) | TBD |
-| Diagnosis: LLM judge vs actual resolution | Agreement rate | TBD |
-| Diagnosis: hand-checked sample (n=20) | Agreement with judge | TBD |
-| Abstention | Rate, and accuracy when not abstaining | TBD |
+| Diagnosis: likely cause vs the engineers' comments | Correct, of tickets whose comments state a cause (24 dev tickets) | **6/10** (second labeler); judge said 13/15 |
+| Diagnosis: when the report did NOT already state the cause | Correct | **1/4** |
+| Judge reliability | Agreement with a second labeler | 59%, **κ = 0.38**: not reliable on its own |
 
 ### Retrieval
 
@@ -359,6 +377,33 @@ The ticket time is when the first signature line appeared, which is when someone
 **First traces:** L02 (anomalous, exception) cited the exception and all three missing write lines, with a coherent cause: the stream read failed, so the write never completed or registered. L03 (normal, with replication) called the replication routine recovery and returned `anomaly_found=false`. L02 also sent `submit_diagnosis({})` three times in a row, the same empty-arguments quirk as in Phase 6, using 6 of its 7 allowed calls.
 
 **Results:** TBD, run pending (free-tier daily limit).
+
+### Diagnosis quality
+
+Everything above measures whether the right tickets get cited. This measures whether the diagnosis is **right**.
+
+**Reference:** each ticket's own engineer comments, written while fixing the bug. The agent never sees them; its input is the summary and description as filed. Comments are cleaned, redacted, and truncated to 8,000 characters.
+
+**Judge:** `nvidia/nemotron-3-ultra-550b-a55b:free`, a different model family from the agent (Qwen), so the agent isn't grading itself. It first writes down the cause the engineers identified, then grades only the diagnosis's likely cause: `correct` (same component and mechanism), `partial` (right area, vague or different mechanism), `wrong`, or `no_reference` (the comments never state a cause). It's told not to reward length.
+
+**Second labeler:** to check the judge, all 22 judged items were labeled again by a second LLM (Claude), on a blind sheet with neutral IDs, shuffled, the ticket key masked, and no judge output. The labeler also marked whether the **bug report as filed already stated the cause**. Both labelers are LLMs; neither is ground truth, and no labels were checked by hand.
+
+**Results** (24 dev tickets, pipeline mode; 1 abstained, 1 judge error):
+
+| | Judge | Second labeler |
+|---|---|---|
+| Comments state a cause | 15 of 22 | 10 of 22 |
+| Correct, of those | 13/15 | 6/10 |
+| Correct when the report already gave the cause | 6/6 | 5/6 |
+| **Correct when the report did NOT give the cause** | 2/4 | **1/4** |
+
+Agreement: 59%, **Cohen's κ = 0.38**. Below about 0.4, the judge's number can't be used on its own.
+
+**The judge is lenient in one direction.** 7 of its 9 disagreements graded higher. In 5 of them, the comments state no cause (only "+1, committed") and the judge marked the diagnosis `correct` anyway: it graded against the cause the *reporter* wrote, despite being told to use the comments. "13/15 correct" mostly measures how well the diagnosis repeats the report.
+
+**What the diagnoses are worth:** many Apache bugs are filed by the developer who already found the cause, and the diagnosis mostly restates it. On the 4 tickets where the cause had to be worked out, 1 was correct. One was wrong in a way that matters: it proposed rejecting an input the engineers decided was valid. With 4 tickets this is a hint, not a rate. The defensible claim is that the pipeline **finds related past tickets and summarizes them with citations**, not that it finds root causes.
+
+**Sample caveats:** 7 of 24 tickets have no stated cause in their comments, and several are backports, documentation fixes or compile errors that don't need diagnosing at all. A diagnosis eval needs tickets whose cause is discussed and isn't in the report; this sample had only 4.
 
 ### Redaction
 
@@ -491,7 +536,7 @@ uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets
 | 5 | Hybrid retrieval, temporal filter, dev/test eval, reranker study | ✅ |
 | 6 | Retrieval first, then an LLM loop written by hand: tools, validation, citation check, limits, audit log, pipeline vs hybrid eval | ✅ |
 | 7 | Loki: 11M HDFS lines loaded, cluster template model, signature analysis, log tools with structured parameters, block-level eval set | 🔄 eval run pending |
-| 8 | Diagnosis eval (LLM judge + hand check), Jira Cloud webhook and posting | ⬜ |
+| 8 | Diagnosis eval (LLM judge + second labeler), webhook receiver, Postgres job queue and worker; Jira poster pending | 🔄 |
 
 ---
 
@@ -577,4 +622,6 @@ uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets
 
 **Abstention is a first-class outcome.** When evidence is weak, the pipeline says so instead of guessing. A confident wrong diagnosis on a production incident is worse than none.
 
-**The LLM judge gets checked.** Diagnosis quality is scored by an LLM against the real resolution, then a hand-checked sample measures how far that judge can be trusted.
+**The LLM judge gets checked, and it failed the check.** A second labeler on a blind sheet agreed with the judge at κ = 0.38. The judge gave credit for restating the reporter's own explanation. Without that check, the README would report "87% correct".
+
+**Split the eval by what the input already contains.** Marking whether the report already stated the cause separated restating (5/6 correct) from working the cause out (1/4). One aggregate number hid the difference.
