@@ -44,7 +44,8 @@ class LLMClient:
                     path.write_text(json.dumps(data))
                 return data  # finish_reason == "error": returned but not cached
             except (RateLimitError, APIConnectionError) as e:
-                if attempt == 4:
+                # the daily quota won't come back in a minute: fail now instead of waiting it out
+                if attempt == 4 or "per-day" in str(e):
                     raise
                 reason = type(e).__name__
             except APIStatusError as e:

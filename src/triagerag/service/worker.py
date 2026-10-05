@@ -98,7 +98,7 @@ def main() -> None:
                 time.sleep(POLL_SECONDS)
                 continue
 
-            print(f"claimed {job[0]} (attempt)", flush=True)
+            print(f"claimed {job[0]}", flush=True)
             try:
                 stopped = process(job, service, llm, jobs)
                 print(f"done {job[0]}: {stopped}", flush=True)
