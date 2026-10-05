@@ -5,16 +5,24 @@ import hashlib
 import hmac
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 import psycopg
 from fastapi import FastAPI, Header, HTTPException, Request, Response
 from fastapi.concurrency import run_in_threadpool
+from fastapi.staticfiles import StaticFiles
 
 from triagerag.config import settings
 from triagerag.jobs.queue import enqueue
+from triagerag.service.api import router as api_router
 from triagerag.shared.redact import redact
 
 app = FastAPI(title="triagerag")
+app.include_router(api_router)
+
+UI_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
+if UI_DIST.is_dir():  # built by `npm run build` in frontend/
+    app.mount("/ui", StaticFiles(directory=UI_DIST, html=True), name="ui")
 
 INLINE_PARENTS = {"paragraph", "heading", "codeBlock"}
 

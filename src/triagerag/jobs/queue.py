@@ -4,12 +4,18 @@ from dataclasses import dataclass
 from typing import Any
 
 import psycopg
+from psycopg.rows import tuple_row
 from psycopg.types.json import Jsonb
 
 from triagerag.jobs import registry
 
 BACKOFF_SECONDS = 30  # retry n waits 30s × 2^attempts
 STALE_MINUTES = 5
+
+
+def _execute(conn: psycopg.Connection, query: str, params: Any = None) -> psycopg.Cursor:
+    # tuple rows whatever the connection's row factory, so callers can pass any connection
+    return conn.cursor(row_factory=tuple_row).execute(query, params)
 
 
 @dataclass
@@ -30,7 +36,7 @@ def enqueue(conn: psycopg.Connection, type: str, payload: dict | None = None, *,
     spec = registry.get(type)  # unknown types fail here, not later in a worker
     params = {"type": type, "payload": Jsonb(payload or {}), "dedupe": dedupe_key,
               "delay": delay, "max": max_attempts or spec.max_attempts, "parent": parent_id}
-    row = conn.execute(
+    row = _execute(conn,
         """insert into jobs (type, payload, dedupe_key, run_after, max_attempts, parent_id)
            values (%(type)s, %(payload)s, %(dedupe)s, now() + make_interval(secs => %(delay)s),
                    %(max)s, %(parent)s)
@@ -38,7 +44,7 @@ def enqueue(conn: psycopg.Connection, type: str, payload: dict | None = None, *,
            returning id""", params).fetchone()
     if row:
         return row[0]
-    existing = conn.execute(
+    existing = _execute(conn,
         "select id from jobs where dedupe_key = %s and status in ('queued', 'running')",
         (dedupe_key,)).fetchone()
     if existing is None:  # the active job finished between the two statements: try once more
@@ -60,18 +66,18 @@ returning id, type, payload, attempts, max_attempts, parent_id"""
 
 
 def claim(conn: psycopg.Connection, types: list[str]) -> Job | None:
-    row = conn.execute(CLAIM, {"types": types}).fetchone()
+    row = _execute(conn, CLAIM, {"types": types}).fetchone()
     return Job(*row) if row else None
 
 
 def complete(conn: psycopg.Connection, job_id: int, result: dict | None = None) -> None:
-    conn.execute("""update jobs set status = 'done', finished_at = now(), result = %s
+    _execute(conn, """update jobs set status = 'done', finished_at = now(), result = %s
                     where id = %s""", (Jsonb(result) if result is not None else None, job_id))
 
 
 def fail(conn: psycopg.Connection, job_id: int, error: str) -> str:
     """Retry later with exponential backoff, or give up after max_attempts. Returns the new status."""
-    return conn.execute(
+    return _execute(conn,
         """update jobs
            set status = case when attempts >= max_attempts then 'failed' else 'queued' end,
                run_after = now() + make_interval(secs => %(base)s * power(2, attempts)),
@@ -83,12 +89,12 @@ def fail(conn: psycopg.Connection, job_id: int, error: str) -> str:
 
 
 def heartbeat(conn: psycopg.Connection, job_id: int) -> None:
-    conn.execute("update jobs set heartbeat_at = now() where id = %s", (job_id,))
+    _execute(conn, "update jobs set heartbeat_at = now() where id = %s", (job_id,))
 
 
 def requeue_stale(conn: psycopg.Connection, minutes: float = STALE_MINUTES) -> int:
     """A job is dead when its heartbeat stopped, not when it has merely run for a long time."""
-    cur = conn.execute(
+    cur = _execute(conn,
         """update jobs
            set status = case when attempts >= max_attempts then 'failed' else 'queued' end,
                finished_at = case when attempts >= max_attempts then now() end,
@@ -102,7 +108,7 @@ def retry(conn: psycopg.Connection, job_id: int) -> bool:
     """Put a failed job back in the queue with fresh attempts. False if it isn't failed, or if
     another active job already holds its dedupe_key."""
     try:
-        cur = conn.execute(
+        cur = _execute(conn,
             """update jobs set status = 'queued', attempts = 0, run_after = now(),
                                finished_at = null, error = null
                where id = %s and status = 'failed'""", (job_id,))

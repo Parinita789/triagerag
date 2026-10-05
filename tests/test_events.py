@@ -1,4 +1,5 @@
 from conftest import StubLLM, make_issue
+
 from triagerag.jobs import events, queue
 from triagerag.jobs.worker import Resources, work
 from triagerag.pipeline import index
