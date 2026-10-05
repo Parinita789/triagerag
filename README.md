@@ -568,6 +568,10 @@ API_KEY=...            # X-API-Key for /jobs, /metrics and the dashboard
 
 Run the service (API on :8000, dashboard at http://localhost:8000/ui):
 ```bash
+make dev    # API (auto-reload) + both workers in one terminal, logs prefixed; Ctrl-C stops all
+```
+`make dev` starts Postgres and Loki, builds the dashboard on first run, and stops everything if any one process dies. The same pieces by hand, one terminal each:
+```bash
 psql postgresql://postgres:dev@localhost:5433/triagerag -f scripts/schema.sql   # idempotent
 (cd frontend && npm ci && npm run build)
 uv run uvicorn triagerag.service.app:app --port 8000
