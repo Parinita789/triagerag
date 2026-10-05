@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     data_dir: Path = Path(__file__).resolve().parents[2] / "data"
     jira_webhook_secret: str = ""
     judge_model: str = ""
+    loki_url: str = "http://localhost:3100"
+    api_key: str = ""  # X-API-Key for /jobs and /metrics; unset = those endpoints refuse every request
 
 
 settings = Settings()

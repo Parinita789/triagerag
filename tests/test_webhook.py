@@ -45,3 +45,28 @@ def test_other_events_ignored(monkeypatch):
     r = TestClient(service.app).post("/webhooks/jira", content=body,
                                      headers={"X-Hub-Signature": sign(body)})
     assert r.status_code == 200 and r.json()["status"] == "ignored"
+
+def _post(event: dict):
+    body = json.dumps(event).encode()
+    return TestClient(service.app).post("/webhooks/jira", content=body,
+                                        headers={"X-Hub-Signature": sign(body)})
+
+
+def test_created_enqueues_triage_once(db, monkeypatch):
+    monkeypatch.setattr(service.settings, "jira_webhook_secret", SECRET)
+    event = {"webhookEvent": "jira:issue_created", "issue": {"key": "HDFS-1", "fields": {
+        "summary": "dn fails", "created": "2026-10-02T12:00:00.000-0700",
+        "description": "key AKIA1234567890ABCDEF leaked"}}}
+    first, second = _post(event), _post(event)
+    assert (first.status_code, second.status_code) == (202, 200)
+    rows = db.execute("select type, payload::text from jobs").fetchall()
+    assert len(rows) == 1 and rows[0][0] == "triage_ticket"
+    assert "AKIA" not in rows[0][1]
+
+
+def test_resolved_enqueues_index(db, monkeypatch):
+    monkeypatch.setattr(service.settings, "jira_webhook_secret", SECRET)
+    r = _post({"webhookEvent": "jira:issue_updated", "issue": {"key": "HDFS-2"},
+               "changelog": {"items": [{"field": "resolution", "to": "1", "toString": "Fixed"}]}})
+    assert r.status_code == 202
+    assert db.execute("select type, payload->>'key' from jobs").fetchall() == [("index_ticket", "HDFS-2")]

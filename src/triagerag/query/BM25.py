@@ -64,8 +64,10 @@ class BM25Index:
         allowed = (self.created < b) & (self.resolved < b) & (self.tickets != exclude)
         s = np.where(allowed, s, -np.inf)
 
-        pool = min(CHUNK_POOL, len(s) - 1)
-        top = np.argpartition(-s, pool)[:pool]
+        pool = min(CHUNK_POOL, len(s))
+        if pool == 0:
+            return []
+        top = np.argpartition(-s, pool - 1)[:pool]
         top = top[np.argsort(-s[top])]
         rows = [(self.tickets[i], float(s[i])) for i in top if s[i] > 0]
         return _group_by_ticket(rows, k)

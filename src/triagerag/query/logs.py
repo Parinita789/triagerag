@@ -9,6 +9,7 @@ from pathlib import Path
 
 import httpx
 
+from triagerag.config import settings
 from triagerag.index.logs.drain import build_miner
 from triagerag.shared.redact import redact
 
@@ -77,8 +78,8 @@ def build_logql(block_id: str | None, contains: str | None,
 
 
 class LogTools:
-    def __init__(self, url: str = "http://localhost:3100"):
-        self.url = url
+    def __init__(self, url: str | None = None):
+        self.url = url or settings.loki_url
         self.http = httpx.Client(timeout=60)
         self.miner = build_miner(MODEL)
         raw = json.loads(BASELINE.read_text())
