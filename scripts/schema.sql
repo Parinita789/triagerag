@@ -35,6 +35,7 @@ create table if not exists chunks (
   template_ids int[],
   exception_signatures text[] default '{}',
   embedding    vector(768),
+  created_at   timestamptz,             -- when the text was written (comment time); retrieval filters on it
   tsv          tsvector generated always as (to_tsvector('english', content)) stored
 );
 
@@ -46,22 +47,65 @@ create table if not exists diagnoses (
   abstained    boolean,
   created_at   timestamptz default now()
 );
+create index if not exists chunks_embedding_idx on chunks using hnsw (embedding vector_cosine_ops);
+create index if not exists chunks_ticket on chunks (ticket_key);
 
-docker compose exec -T db psql -U postgres -d triagerag <<'SQL'
-create table if not exists triage_jobs (
-  issue_key   text primary key,               -- idempotency: one job per issue
+-- Execution: one row per job run. Bull-style queue on Postgres (FOR UPDATE SKIP LOCKED).
+create table if not exists jobs (
+  id            bigserial primary key,
+  type          text not null,
+  payload       jsonb not null default '{}',
+  dedupe_key    text,
+  status        text not null default 'queued'
+                check (status in ('queued', 'running', 'done', 'failed')),
+  attempts      int not null default 0,
+  max_attempts  int not null default 3,
+  run_after     timestamptz not null default now(),
+  parent_id     bigint references jobs(id),
+  created_at    timestamptz not null default now(),
+  started_at    timestamptz,
+  finished_at   timestamptz,
+  heartbeat_at  timestamptz,
+  result        jsonb,
+  error         text
+);
+-- at most one ACTIVE job per dedupe_key: fifty resolved tickets cause one BM25 refresh
+create unique index if not exists jobs_dedupe on jobs (dedupe_key) where status in ('queued', 'running');
+create index if not exists jobs_ready on jobs (run_after) where status = 'queued';
+create index if not exists jobs_parent on jobs (parent_id);
+
+-- What each step of a job did, for the dashboard. Text is always the redacted version.
+create table if not exists job_events (
+  id          bigserial primary key,
+  job_id      bigint not null references jobs(id) on delete cascade,
+  seq         int not null,
+  step        text not null,
+  status      text not null,
+  ms          int,
+  tokens      int,
+  input       jsonb,
+  output      jsonb,
+  created_at  timestamptz not null default now()
+);
+create index if not exists job_events_job on job_events (job_id, seq);
+
+-- Outcome: one row per Jira issue (also the once-per-issue webhook check). jobs handles execution.
+create table if not exists triages (
+  issue_key   text primary key,
+  job_id      bigint references jobs(id) on delete set null,
   summary     text not null,                  -- stored redacted
   description text not null default '',       -- stored redacted
   created_at  timestamptz not null,           -- when the issue was filed in Jira
-  status      text not null default 'queued'
-              check (status in ('queued', 'running', 'done', 'failed')),
-  attempts    int not null default 0,
   received_at timestamptz not null default now(),
-  started_at  timestamptz,
   finished_at timestamptz,
   comment     text,                           -- what was (or would be) posted
-  result      jsonb,                          -- diagnosis, trace summary, cost
-  error       text
+  result      jsonb                           -- diagnosis, cost
 );
-create index if not exists triage_jobs_queued on triage_jobs (received_at) where status = 'queued';
-SQL
+
+-- Shared index version: the BM25 index lives in each triage worker's memory, so a refresh
+-- bumps this number and workers rebuild when theirs is behind.
+create table if not exists index_state (
+  id            int primary key default 1 check (id = 1),
+  bm25_version  int not null default 0
+);
+insert into index_state (id) values (1) on conflict do nothing;
