@@ -22,6 +22,7 @@ class LLMClient:
                             timeout=REQUEST_TIMEOUT, max_retries=0)
         self.model = model
         self.use_cache = use_cache
+        self.last_cache_hit = False  # for the step log: was the last reply served from disk?
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     def chat(self, messages: list[dict], tools: list[dict]) -> dict[str, Any]:
@@ -32,7 +33,8 @@ class LLMClient:
         }
         key = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
         path = CACHE_DIR / f"{key}.json"
-        if self.use_cache and path.exists():
+        self.last_cache_hit = self.use_cache and path.exists()
+        if self.last_cache_hit:
             return json.loads(path.read_text())
 
         for attempt in range(1, 5):

@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 
 from psycopg.types.json import Jsonb
 
+from triagerag.jobs.events import record_step
 from triagerag.jobs.registry import job
 from triagerag.jobs.worker import current_bm25_version
 from triagerag.query.agent import AgentResult, run_agent
@@ -60,8 +61,13 @@ def triage_ticket(ctx, payload: dict) -> dict:
     """Payload: key, summary, description (already redacted at enqueue), created_at (ISO).
     Without a key ("Try it" in the dashboard), the triage is stored as TRY-<job id>."""
     key = payload.get("key") or f"TRY-{ctx.job.id}"
-    summary = redact(payload.get("summary") or "")[0]
-    description = redact(payload.get("description") or "")[0]
+    # the API and webhook redact before enqueueing; redacting again is cheap and covers any other path
+    summary, c1 = redact(payload.get("summary") or "")
+    description, c2 = redact(payload.get("description") or "")
+    counts = dict(c1 + c2)
+    for kind, n in (payload.get("redactions") or {}).items():
+        counts[kind] = counts.get(kind, 0) + n
+    record_step("redact", output={"summary": summary, "description": description, "counts": counts})
     created_at = parse_time(payload.get("created_at"))
 
     sync_bm25(ctx.resources)
@@ -69,6 +75,7 @@ def triage_ticket(ctx, payload: dict) -> dict:
     tctx = ToolContext(service=ctx.resources.search, before=created_at, exclude=key)
     r = run_agent(f"{summary}\n\n{description}".strip(), tctx, ctx.resources.llm, extra_calls=0)
     comment = format_comment(r)  # written even when the LLM failed: then it lists the related tickets
+    record_step("comment", output={"comment": comment, "stopped": r.stopped})
     result = {
         "key": key, "stopped": r.stopped, "related": r.related, "llm_calls": r.llm_calls,
         "tokens": r.tokens, "seconds": round(time.time() - start, 1), "error": r.error,

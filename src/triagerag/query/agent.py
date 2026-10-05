@@ -1,8 +1,10 @@
 import json
+import time
 from dataclasses import dataclass, field
 
 from openai import OpenAIError
 
+from triagerag.jobs.events import record_step
 from triagerag.query.llm import LLMClient
 from triagerag.query.tools import (LOG_TOOLS, TICKET_TOOLS, DiagnosisArgs, ToolContext, TraceEvent,
                                    execute)
@@ -64,14 +66,26 @@ def _loop(messages: list[dict], tools: list[dict], ctx: ToolContext, llm: LLMCli
         return AgentResult(diagnosis, stopped, related, llm_calls, used, tokens, ctx.trace, error)
 
     while True:
+        start = time.perf_counter()
+        sent = [{"role": m["role"], "content": m.get("content") or ""} for m in messages]
         try:
             resp = llm.chat(messages, tools)
         except OpenAIError as e:
+            record_step("llm", {"messages": sent}, {"error": str(e)[:300]},
+                        int((time.perf_counter() - start) * 1000), status="error")
             return done(None, "llm_error", str(e)[:300])
         llm_calls += 1
-        tokens += (resp.get("usage") or {}).get("total_tokens", 0)
+        used_tokens = (resp.get("usage") or {}).get("total_tokens", 0)
+        tokens += used_tokens
 
         msg = resp["choices"][0]["message"]
+        record_step("llm", {"messages": sent}, {
+            "reply": msg.get("content") or "",
+            "tool_calls": [{"name": tc["function"]["name"], "arguments": tc["function"].get("arguments")}
+                           for tc in msg.get("tool_calls") or []],
+            "finish_reason": resp["choices"][0].get("finish_reason"),
+            "cache_hit": getattr(llm, "last_cache_hit", None),
+        }, int((time.perf_counter() - start) * 1000), used_tokens)
         tool_calls = msg.get("tool_calls") or []
         assistant = {"role": "assistant", "content": msg.get("content") or ""}
         if tool_calls:

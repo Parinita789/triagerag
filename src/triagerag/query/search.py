@@ -5,6 +5,7 @@ import psycopg
 from pgvector.psycopg import register_vector
 
 from triagerag.index.embed import QUERY_PREFIX, model
+from triagerag.jobs.events import timed
 from triagerag.query.BM25 import BM25Index
 from triagerag.query.fuse import rrf
 from triagerag.query.retrieve import dense
@@ -14,6 +15,10 @@ SNIPPET_CHARS = 400
 DESCRIPTION_CHARS = 1500
 COMMENT_CHARS = 600
 MAX_COMMENTS = 6
+
+
+def _top(hits: list[tuple[str, float]], n: int = 10) -> list[dict]:
+    return [{"key": key, "rank": i, "score": round(score, 4)} for i, (key, score) in enumerate(hits[:n], 1)]
 
 
 @dataclass
@@ -48,10 +53,20 @@ class SearchService:
         self.bm25 = BM25Index(conn)
 
     def search(self, text: str, before: datetime, exclude: str, k: int = 5) -> list[TicketHit]:
-        vec = model().encode(QUERY_PREFIX + text, normalize_embeddings=True)
-        d = [t for t, _ in dense(self.conn, vec, before, exclude, k=FUSION_DEPTH)]
-        b = [t for t, _ in self.bm25.search(text, before, exclude, k=FUSION_DEPTH)]
-        keys = rrf([d, b], top=k)
+        with timed("retrieve.dense", {"query": text}) as rec:
+            vec = model().encode(QUERY_PREFIX + text, normalize_embeddings=True)
+            dense_hits = dense(self.conn, vec, before, exclude, k=FUSION_DEPTH)
+            rec["output"] = _top(dense_hits)
+        with timed("retrieve.bm25", {"query": text}) as rec:
+            bm25_hits = self.bm25.search(text, before, exclude, k=FUSION_DEPTH)
+            rec["output"] = _top(bm25_hits)
+        d = [t for t, _ in dense_hits]
+        b = [t for t, _ in bm25_hits]
+        with timed("rrf") as rec:
+            keys = rrf([d, b], top=k)
+            rank = lambda ranking, key: ranking.index(key) + 1 if key in ranking else None  # noqa: E731
+            rec["output"] = [{"key": key, "rank": i, "dense_rank": rank(d, key), "bm25_rank": rank(b, key)}
+                             for i, key in enumerate(keys, 1)]
         if not keys:
             return []
 

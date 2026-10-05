@@ -8,6 +8,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
+from triagerag.jobs.events import record_step
 from triagerag.query.logs import LogTools
 from triagerag.query.search import SearchService
 
@@ -256,6 +257,9 @@ def _submit(parsed: dict, ctx: ToolContext) -> tuple[str, DiagnosisArgs]:
     d.evidence_templates = [e for e in d.evidence_templates if e.template_id in ctx.seen_templates]
     # re-check: a diagnosis whose citations were all invented must not pass with an empty list
     d = DiagnosisArgs.model_validate(d.model_dump())
+    record_step("validate", output={
+        "kept": [t.key for t in d.related_tickets] + [f"T{e.template_id}" for e in d.evidence_templates],
+        "dropped": dropped, "abstain": d.abstain, "errors": []})
     return "Diagnosis received." + (f" Removed citations not seen in tool results: {dropped}" if dropped else ""), d
 
 
@@ -297,7 +301,11 @@ def execute(name: str, raw_args: str, ctx: ToolContext) -> tuple[str, DiagnosisA
 
     if error:
         diagnosis = None
+        if name == "submit_diagnosis":
+            record_step("validate", output={"kept": [], "dropped": [], "errors": [error]}, status="error")
     text = f"ERROR: {error}" if error else out
-    ctx.trace.append(TraceEvent(name, (raw_args or "")[:300], len(text),
-                                int((time.perf_counter() - start) * 1000), error))
+    ms = int((time.perf_counter() - start) * 1000)
+    ctx.trace.append(TraceEvent(name, (raw_args or "")[:300], len(text), ms, error))
+    record_step("tool", {"name": name, "arguments": raw_args or ""},
+                {"result": text[:2000], "error": error}, ms, status="error" if error else "ok")
     return text, diagnosis
