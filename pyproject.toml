@@ -13,6 +13,7 @@ dependencies = [
     "pydantic-settings",
     "python-dotenv",
     "sentence-transformers>=6.1.0",
+    "torch",
     "uvicorn>=0.54.0",
 ]
 
@@ -39,3 +40,13 @@ pythonpath = ["src"]
 dev = [
     "pytest>=9.1.1",
 ]
+
+# Linux (the Docker image) gets CPU-only torch: the embedder runs on CPU, and the default
+# wheels pull several GB of CUDA libraries. macOS keeps the PyPI build.
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [{ index = "pytorch-cpu", marker = "sys_platform == 'linux'" }]

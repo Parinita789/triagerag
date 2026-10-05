@@ -158,23 +158,63 @@ A cross-encoder reranker and template-ID matching were both built and measured, 
 
 **Diagnosis.** The model writes a diagnosis that cites specific tickets, each with a reason. If the evidence is weak, it abstains. The diagnosis goes through `redact()` once more, since the LLM only saw pseudonyms but can still invent a plausible email or reconstruct something a detector missed. The result becomes a Jira comment. If the LLM fails, the comment still lists the retrieved tickets.
 
-### Part 3: The service
+### Part 3: The service: a Bull-style job queue on Postgres
+
+Every pipeline step runs as a job. Webhooks and the API enqueue jobs, workers run them, each step records what it did, and a dashboard shows it all live.
 
 ```
-Jira ──webhook──▶ FastAPI: verify signature ─▶ insert job (once per issue) ─▶ 202 in ms
-                                                        │
-                                       Postgres table triage_jobs (the queue)
-                                                        │
-                  worker: claim job (FOR UPDATE SKIP LOCKED) ─▶ retrieval ─▶ LLM ─▶ redact ─▶ comment
+                 ┌──────────────────── FastAPI ─────────────────────┐
+Jira webhooks ──▶│ POST /webhooks/jira   created  → triage_ticket    │
+                 │                       resolved → index_ticket     │
+Dashboard /   ──▶│ POST /jobs  GET /jobs  GET /jobs/{id}              │
+you              │ GET /jobs/{id}/stream (SSE)  POST /jobs/{id}/retry │
+                 │ GET /metrics/jobs   GET /ui (React dashboard)      │
+                 └──────────────────────┬────────────────────────────┘
+                                        ▼
+                     Postgres: jobs, job_events, triages, index_state
+                                        ▼
+        worker --types triage_ticket          worker --types index_ticket,index_batch,reindex_all,
+        (fast, calls the LLM)                                refresh_bm25,load_logs  (heavy)
+                                        ▼
+                  src/triagerag/pipeline/*   ◀── scripts/*.py are thin CLI wrappers
 ```
+
+| BullMQ | Here |
+|---|---|
+| `queue.add(name, data, opts)` | `enqueue(conn, type, payload, dedupe_key=, delay=, max_attempts=, parent_id=)` |
+| `queue.process(name, fn)` | `@job("type")` decorator + registry; unknown types are rejected at enqueue |
+| `attempts`, `backoff: exponential` | `max_attempts`, `run_after = now() + 30s × 2^attempts` |
+| `delay` | `run_after` |
+| `jobId` dedupe | `dedupe_key` + a partial unique index over queued/running jobs |
+| Stalled-job check | `heartbeat_at` + `requeue_stale`: dead = no heartbeat for 5 min, not "ran long" |
+| Flows (parent/children) | `parent_id`; `reindex_all` fans out one `index_batch` per 200 tickets |
+| Named queues / separate workers | `python -m triagerag.jobs.worker --types ...` |
+| Bull Board | `/ui` |
+| Redis | Postgres `FOR UPDATE SKIP LOCKED` |
 
 - **Signature check over the raw bytes**, compared in constant time. Re-serializing the JSON first would change the bytes and fail every real webhook.
-- **Idempotent:** the issue key is the primary key and the insert uses `on conflict do nothing`. A Jira retry gets `200 duplicate` instead of a second comment.
-- **Redacted at ingestion**, so the queue table never holds raw secrets.
-- **Return fast, work later.** The receiver answers in milliseconds; retrieval and the LLM take 10–60 s in a separate worker.
-- **Postgres as the queue**, not in-process background tasks, which a crash or restart would lose. `FOR UPDATE SKIP LOCKED` lets several workers run without ever claiming the same job. A job left `running` by a dead worker goes back to the queue after 10 minutes, or to `failed` after 3 attempts.
-- **Graceful degradation:** when the LLM is down or over budget, the comment still lists the 5 related tickets, since retrieval needs no LLM. Tested end to end with the daily quota exhausted.
-- **Jira posting** is the remaining piece: a dry-run poster stores the comment in `triage_jobs.comment`; a real poster against a mocked Jira API is planned. It hasn't been run against a live Jira site.
+- **Once per issue:** `triages.issue_key` is the primary key, inserted `on conflict do nothing` in the same transaction as the enqueue. A Jira retry gets `200 duplicate` instead of a second comment.
+- **Redacted at ingestion.** The webhook and `POST /jobs` redact every string in the payload before it's stored, so `jobs` never holds raw secrets; the per-detector counts travel with the payload.
+- **Execution vs outcome:** `jobs` is execution only (status, attempts, errors). `triages` holds one row per issue with the comment, diagnosis and cost.
+- **Dedupe:** at most one *active* job per `dedupe_key`. Fifty resolved tickets cause a handful of BM25 refreshes, not fifty.
+- **The BM25 problem.** The BM25 index lives in each triage worker's memory, so an index worker can't update it. `refresh_bm25` bumps `index_state.bm25_version`; before each triage, a worker compares it with its own version and rebuilds if it's behind. New tickets are searchable seconds after their resolved webhook, with no manual re-index.
+- **Idempotent indexing:** a ticket's old chunks are deleted and the new ones inserted in one transaction, so indexing twice never duplicates.
+- **Step events.** The worker puts the job id in a `ContextVar`; pipeline code calls `record_step(...)` without passing ids around (and it's a no-op in CLI scripts and evals). One triage records ~9 events: `redact`, `retrieve.dense`, `retrieve.bm25`, `rrf`, `tool`, `llm`, `validate`, `tool`, `comment`. Each input/output is redacted again and capped at 8 KB. A test sends a fake AWS key and checks that no event contains it.
+- **Live updates over SSE.** `GET /jobs/{id}/stream` polls `job_events` every 500 ms and closes when the job ends. That's simpler than WebSockets and enough for one-way updates.
+- **Graceful degradation:** when the LLM is down or over budget, the comment still lists the 5 related tickets, since retrieval needs no LLM. A daily-limit 429 fails immediately instead of retrying.
+- **Graceful shutdown:** SIGTERM lets the current job finish. Heavy resources (embedder, `SearchService`) load once per process, and only in workers whose jobs use them.
+- **Auth:** every endpoint except the webhook needs `X-API-Key`. The dashboard keeps the key in memory only.
+- **Jira posting** is the remaining piece: the comment is stored in `triages.comment` (dry run). It hasn't been run against a live Jira site.
+
+**Dashboard** (`frontend/`, React + Vite + TypeScript, served at `/ui`):
+- **Queue board:** queued / running / done / failed columns with live counts, attempts, age, last error, and a retry button.
+- **Job timeline:** a waterfall of steps with durations; click a step to see its input and output; error history; a fan-out progress bar.
+- **Triage inspector:** ticket text with redactions highlighted; dense, BM25 and RRF ranks side by side; the LLM prompt and reply; citations kept and dropped; the comment.
+- **Try it:** paste a ticket and watch every step arrive live.
+
+<!-- demo GIF: docs/try-it.gif -->
+
+**When I'd use Celery or RQ instead:** several services sharing queues, sustained high throughput (thousands of jobs per second, where polling Postgres becomes the bottleneck), or a broker already in place. Here the jobs are few and slow (seconds to minutes), Postgres is already the system of record, and enqueueing in the same transaction as the `triages` insert is something a separate broker can't give.
 
 ---
 
@@ -462,7 +502,15 @@ triagerag/
 │   │   ├── tools.py       #   tool schemas, Pydantic validation, citation check
 │   │   ├── agent.py       #   retrieval first, then the LLM loop; limits, audit log
 │   │   └── post.py        #   Jira comment
-│   └── eval/              # retrieval, agent, and diagnosis evaluation
+│   ├── eval/              # retrieval, agent, and diagnosis evaluation
+│   ├── jobs/              # Part 3: the queue
+│   │   ├── queue.py       #   enqueue, claim, complete, fail + backoff, heartbeat, requeue_stale, retry
+│   │   ├── registry.py    #   @job("type") → handler
+│   │   ├── worker.py      #   claim loop, --types filter, graceful SIGTERM, lazy heavy resources
+│   │   └── events.py      #   record_step / timed: step events via a ContextVar
+│   ├── pipeline/          # job handlers: triage, index (+ fan-out), bm25, logs
+│   └── service/           # FastAPI: webhook, jobs API, SSE, /ui
+├── frontend/              # React + Vite + TS dashboard (npm run build → frontend/dist)
 ├── models/
 │   ├── drain_state.bin             # template model trained on ticket logs, versioned in git
 │   ├── drain_hdfs.bin              # template model trained on the HDFS cluster logs
@@ -514,7 +562,27 @@ DATABASE_URL=postgresql://postgres:dev@localhost:5433/triagerag
 LOKI_URL=http://localhost:3100
 OPENROUTER_API_KEY=...
 OPENROUTER_MODEL=qwen/qwen3.8-27b:free
+JIRA_WEBHOOK_SECRET=...
+API_KEY=...            # X-API-Key for /jobs, /metrics and the dashboard
 ```
+
+Run the service (API on :8000, dashboard at http://localhost:8000/ui):
+```bash
+psql postgresql://postgres:dev@localhost:5433/triagerag -f scripts/schema.sql   # idempotent
+(cd frontend && npm ci && npm run build)
+uv run uvicorn triagerag.service.app:app --port 8000
+uv run python -m triagerag.jobs.worker --types triage_ticket
+uv run python -m triagerag.jobs.worker --types index_ticket,index_batch,reindex_all,refresh_bm25,load_logs
+
+curl -XPOST localhost:8000/jobs -H "X-API-Key: $API_KEY" -H 'content-type: application/json' \
+     -d '{"type":"index_ticket","payload":{"key":"HDFS-1234"}}'          # → {"id": N}
+curl -N "localhost:8000/jobs/N/stream?key=$API_KEY"                      # steps as they happen
+```
+Or all of it in Docker: `docker compose up --build` (api, worker-triage, worker-index, db, loki). The image includes PyTorch for the embedder, so it's large.
+
+For dashboard development, run `npm run dev` in `frontend/` (Vite proxies the API to :8000).
+
+Tests: `uv run pytest`. Queue, pipeline, event and API tests run against a `triagerag_test` database on the compose Postgres (created automatically), and they skip when Postgres isn't running. They use a stub LLM, so no quota is spent.
 
 Run the agent:
 ```bash
@@ -536,7 +604,10 @@ uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets
 | 5 | Hybrid retrieval, temporal filter, dev/test eval, reranker study | ✅ |
 | 6 | Retrieval first, then an LLM loop written by hand: tools, validation, citation check, limits, audit log, pipeline vs hybrid eval | ✅ |
 | 7 | Loki: 11M HDFS lines loaded, cluster template model, signature analysis, log tools with structured parameters, block-level eval set | 🔄 eval run pending |
-| 8 | Diagnosis eval (LLM judge + second labeler), webhook receiver, Postgres job queue and worker; Jira poster pending | 🔄 |
+| 8 | Diagnosis eval (LLM judge + second labeler), webhook receiver, first queue and worker | ✅ |
+| 9 | Bull-style job queue on Postgres (retries, backoff, dedupe, heartbeats, fan-out), pipeline as jobs, step events, jobs API + SSE, React dashboard, Docker services; Jira poster pending | 🔄 |
+
+**Future work** (deliberately not built): LLM tracing with Langfuse, `LISTEN/NOTIFY` instead of polling, job priorities, cron scheduling, per-type rate limits, auth beyond an API key, multi-tenant queues.
 
 ---
 

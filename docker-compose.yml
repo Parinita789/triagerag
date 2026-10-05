@@ -1,3 +1,15 @@
+x-app: &app
+  build: .
+  env_file: .env
+  environment:
+    DATABASE_URL: postgresql://postgres:dev@db:5432/triagerag
+    LOKI_URL: http://loki:3100
+  volumes:
+    - ./data:/app/data                     # LLM response cache, HDFS.log for load_logs
+    - hf-cache:/root/.cache/huggingface    # embedding model, downloaded once
+  depends_on: [db]
+  restart: unless-stopped
+
 services:
   db:
     image: pgvector/pgvector:pg16
@@ -5,7 +17,9 @@ services:
       POSTGRES_PASSWORD: dev
       POSTGRES_DB: triagerag
     ports: ["5433:5432"]
-    volumes: ["pgdata:/var/lib/postgresql/data"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro   # first start only
   loki:
     image: grafana/loki:3.5.0
     command: -config.file=/etc/loki/config.yml
@@ -13,8 +27,26 @@ services:
       - "3100:3100"
     volumes:
       - ./loki-config.yml:/etc/loki/config.yml:ro
-      - loki-data:/loki  
+      - loki-data:/loki
+
+  api:
+    <<: *app
+    ports: ["8000:8000"]
+
+  # fast: one LLM call per job; scale with `docker compose up --scale worker-triage=3`
+  worker-triage:
+    <<: *app
+    command: python -m triagerag.jobs.worker --types triage_ticket
+    stop_grace_period: 2m                  # SIGTERM lets the current job finish
+
+  # heavy: embeddings and bulk loads, kept off the triage path
+  worker-index:
+    <<: *app
+    command: python -m triagerag.jobs.worker --types index_ticket,index_batch,reindex_all,refresh_bm25,load_logs
+    depends_on: [db, loki]
+    stop_grace_period: 5m
 
 volumes:
   pgdata:
   loki-data:
+  hf-cache:

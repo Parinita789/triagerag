@@ -16,3 +16,4 @@ __pycache__/
 # Dashboard
 frontend/node_modules/
 frontend/dist/
+frontend/*.tsbuildinfo
