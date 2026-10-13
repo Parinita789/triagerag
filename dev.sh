@@ -2,14 +2,15 @@
 # Local dev: API (auto-reload) + triage worker + index worker in one terminal, logs prefixed.
 # Ctrl-C stops all three. Production runs them as separate processes (see docker-compose.yml).
 set -euo pipefail
-cd "$(dirname "$0")/.."
+ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$ROOT"
 
 TRIAGE_TYPES=triage_ticket
 INDEX_TYPES=index_ticket,index_batch,reindex_all,refresh_bm25,load_logs
 export PYTHONUNBUFFERED=1
 
-if ! grep -qE '^API_KEY=.+' .env 2>/dev/null; then
-  echo "warning: API_KEY is not set in .env; /jobs and the dashboard will answer 401" >&2
+if ! grep -qE '^API_KEY=.+' backend/.env 2>/dev/null; then
+  echo "warning: API_KEY is not set in backend/.env; /jobs and the dashboard will answer 401" >&2
 fi
 
 docker compose up -d db loki
@@ -19,6 +20,7 @@ if [ ! -d frontend/dist ]; then
   (cd frontend && npm install --no-audit --no-fund && npm run build) >/dev/null
 fi
 
+cd backend     # the API and workers run from backend/: data/, models/ and .env are found there
 uv sync -q
 BIN=.venv/bin   # run the programs directly, so a signal reaches them and not a wrapper
 

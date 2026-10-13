@@ -1,11 +1,11 @@
 x-app: &app
   build: .
-  env_file: .env
+  env_file: backend/.env
   environment:
     DATABASE_URL: postgresql://postgres:dev@db:5432/triagerag
     LOKI_URL: http://loki:3100
   volumes:
-    - ./data:/app/data                     # LLM response cache, HDFS.log for load_logs
+    - ./backend/data:/app/data                     # LLM response cache, HDFS.log for load_logs
     - hf-cache:/root/.cache/huggingface    # embedding model, downloaded once
   depends_on: [db]
   restart: unless-stopped
@@ -19,7 +19,7 @@ services:
     ports: ["5433:5432"]
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro   # first start only
+      - ./backend/scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro   # first start only
   loki:
     image: grafana/loki:3.5.0
     command: -config.file=/etc/loki/config.yml

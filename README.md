@@ -28,7 +28,7 @@ The query side reuses the indexing code for cleaning, redaction, extraction, and
 
 ### Part 1: Indexing
 
-**1. Fetch tickets.** Every resolved HDFS ticket (all types, not just bugs) comes from Apache's public Jira REST API, paged 100 at a time. Raw JSON is saved to `data/jira/raw_all/` first, so the API is hit once and every later step re-runs from disk.
+**1. Fetch tickets.** Every resolved HDFS ticket (all types, not just bugs) comes from Apache's public Jira REST API, paged 100 at a time. Raw JSON is saved to `backend/data/jira/raw_all/` first, so the API is hit once and every later step re-runs from disk.
 
 **2. Load.** Tickets go into a `tickets` table with the full raw JSON kept alongside, and every issue link goes into `ticket_links`.
 
@@ -489,46 +489,52 @@ Across descriptions and comments together: 759 emails and 2 credentials redacted
 
 ```
 triagerag/
-├── src/triagerag/
-│   ├── shared/            # used by both pipelines
-│   │   ├── clean.py       #   code-block split, Jira markup stripping, bot-comment filter
-│   │   ├── redact.py      #   secret and PII detection, HMAC pseudonyms
-│   │   ├── extract.py     #   log lines and exceptions found by shape, in blocks and prose
-│   │   └── normalize.py   #   template lookup + exception class
-│   ├── index/             # Part 1
-│   │   ├── logs/          #   HDFS reader, Drain training
-│   │   ├── jira.py        #   fetch and load tickets and links
-│   │   ├── chunk.py
-│   │   └── embed.py
-│   ├── query/             # Part 2
-│   │   ├── retrieve.py    #   dense search, grouping chunks into tickets
-│   │   ├── bm25.py        #   BM25 over an in-memory inverted index
-│   │   ├── fuse.py        #   reciprocal rank fusion
-│   │   ├── rerank.py      #   cross-encoder (measured, not used)
-│   │   ├── search.py      #   SearchService: RRF search + get_ticket, time-filtered
-│   │   ├── llm.py         #   OpenRouter client: timeout, retries, response cache
-│   │   ├── logs.py        #   Loki tools: structured params -> LogQL, Drain templates vs baseline
-│   │   ├── tools.py       #   tool schemas, Pydantic validation, citation check
-│   │   ├── agent.py       #   retrieval first, then the LLM loop; limits, audit log
-│   │   └── post.py        #   Jira comment
-│   ├── eval/              # retrieval, agent, and diagnosis evaluation
-│   ├── jobs/              # Part 3: the queue
-│   │   ├── queue.py       #   enqueue, claim, complete, fail + backoff, heartbeat, requeue_stale, retry
-│   │   ├── registry.py    #   @job("type") → handler
-│   │   ├── worker.py      #   claim loop, --types filter, graceful SIGTERM, lazy heavy resources
-│   │   └── events.py      #   record_step / timed: step events via a ContextVar
-│   ├── pipeline/          # job handlers: triage, index (+ fan-out), bm25, logs
-│   └── service/           # FastAPI: webhook, jobs API, SSE, /ui
+├── backend/               # Python: API, workers, pipeline, evals (run commands from here)
+│   ├── pyproject.toml, uv.lock, .env
+│   ├── src/triagerag/
+│   │   ├── shared/            # used by both pipelines
+│   │   │   ├── clean.py       #   code-block split, Jira markup stripping, bot-comment filter
+│   │   │   ├── redact.py      #   secret and PII detection, HMAC pseudonyms
+│   │   │   ├── extract.py     #   log lines and exceptions found by shape, in blocks and prose
+│   │   │   └── normalize.py   #   template lookup + exception class
+│   │   ├── index/             # Part 1
+│   │   │   ├── logs/          #   HDFS reader, Drain training
+│   │   │   ├── jira.py        #   fetch and load tickets and links
+│   │   │   ├── chunk.py
+│   │   │   └── embed.py
+│   │   ├── query/             # Part 2
+│   │   │   ├── retrieve.py    #   dense search, grouping chunks into tickets
+│   │   │   ├── bm25.py        #   BM25 over an in-memory inverted index
+│   │   │   ├── fuse.py        #   reciprocal rank fusion
+│   │   │   ├── rerank.py      #   cross-encoder (measured, not used)
+│   │   │   ├── search.py      #   SearchService: RRF search + get_ticket, time-filtered
+│   │   │   ├── llm.py         #   OpenRouter client: timeout, retries, response cache
+│   │   │   ├── logs.py        #   Loki tools: structured params -> LogQL, Drain templates vs baseline
+│   │   │   ├── tools.py       #   tool schemas, Pydantic validation, citation check
+│   │   │   ├── agent.py       #   retrieval first, then the LLM loop; limits, audit log
+│   │   │   └── post.py        #   Jira comment
+│   │   ├── eval/              # retrieval, agent, and diagnosis evaluation
+│   │   ├── jobs/              # Part 3: the queue
+│   │   │   ├── queue.py       #   enqueue, claim, complete, fail + backoff, heartbeat, requeue_stale, retry
+│   │   │   ├── registry.py    #   @job("type") → handler
+│   │   │   ├── worker.py      #   claim loop, --types filter, graceful SIGTERM, lazy heavy resources
+│   │   │   └── events.py      #   step / record_step: the job lifecycle via ContextVars
+│   │   ├── pipeline/          # job handlers: triage, index (+ fan-out), bm25, logs
+│   │   └── service/           # FastAPI: webhook, jobs API, SSE, /ui
+│   ├── models/
+│   │   ├── drain_state.bin             # template model trained on ticket logs, versioned in git
+│   │   ├── drain_hdfs.bin              # template model trained on the HDFS cluster logs
+│   │   └── hdfs_template_baseline.json # share of blocks containing each template (no labels)
+│   ├── scripts/               # entrypoints: fetch_jira.py, load_jira.py, train_drain.py,
+│   │                          #   bench_redact.py, inspect_redact.py, check_clean.py, ...
+│   ├── tests/
+│   └── data/                  # gitignored: raw Jira JSON, HDFS logs
 ├── frontend/              # React + Vite + TS dashboard (npm run build → frontend/dist)
-├── models/
-│   ├── drain_state.bin             # template model trained on ticket logs, versioned in git
-│   ├── drain_hdfs.bin              # template model trained on the HDFS cluster logs
-│   └── hdfs_template_baseline.json # share of blocks containing each template (no labels)
-├── scripts/               # entrypoints: fetch_jira.py, load_jira.py, train_drain.py,
-│                          #   bench_redact.py, inspect_redact.py, check_clean.py, ...
-├── tests/
-├── loki-config.yaml
-└── data/                  # gitignored: raw Jira JSON, HDFS logs
+├── docker-compose.yml     # db, loki, api, worker-triage, worker-index
+├── Dockerfile             # builds the dashboard and the backend into one image
+├── loki-config.yml
+├── Makefile               # make dev · make ui · make test
+└── dev.sh                 # what make dev runs
 ```
 
 ---
@@ -538,22 +544,24 @@ triagerag/
 ```bash
 git clone https://github.com/Parinita789/triagerag
 cd triagerag
-uv sync
+docker compose up -d db loki   # Postgres + Loki (from the repo root)
 
-docker compose up -d          # Postgres + Loki
-docker compose exec -T db psql -U postgres -d triagerag -f - < scripts/schema.sql
+cd backend                     # every Python command below runs from backend/
+uv sync
+cp .env.example .env           # then fill it in (see below)
+psql postgresql://postgres:dev@localhost:5433/triagerag -f scripts/schema.sql
 
 # Jira tickets
 uv run python scripts/fetch_jira.py
 uv run python scripts/load_jira.py
 
-# HDFS logs (for Loki and Drain validation)
+# HDFS logs (for Loki and Drain validation), into backend/data/
 mkdir -p data && cd data
 curl -L "https://zenodo.org/records/8196385/files/HDFS_v1.zip?download=1" -o HDFS_v1.zip
 unzip HDFS_v1.zip && cd ..
 ```
 
-Logs into Loki, then the cluster template model and the log eval set:
+Logs into Loki, then the cluster template model and the log eval set (from `backend/`):
 ```bash
 uv run python scripts/load_loki.py          # 11M lines, ~2 min; flushes to storage at the end
 uv run python scripts/loki_count.py         # per-stream counts should match the loader's
@@ -563,9 +571,9 @@ uv run python scripts/eval_log_agent.py --id L02   # one ticket, with trace
 ```
 To reload Loki, remove the volume first (`docker compose rm -sf loki && docker volume rm triagerag_loki-data`); loading flushed data a second time creates duplicates.
 
-The trained template model is committed in `models/`, so retraining is only needed after changing the masking rules or the threshold.
+The trained template model is committed in `backend/models/`, so retraining is only needed after changing the masking rules or the threshold.
 
-`.env`:
+`backend/.env`:
 ```
 DATABASE_URL=postgresql://postgres:dev@localhost:5433/triagerag
 LOKI_URL=http://localhost:3100
@@ -575,14 +583,15 @@ JIRA_WEBHOOK_SECRET=...
 API_KEY=...            # X-API-Key for /jobs, /metrics and the dashboard
 ```
 
-Run the service (API on :8000, dashboard at http://localhost:8000/ui):
+Run the service (API on :8000, dashboard at http://localhost:8000/ui), from the repo root:
 ```bash
 make dev    # API (auto-reload) + both workers in one terminal, logs prefixed; Ctrl-C stops all
 ```
 `make dev` starts Postgres and Loki, builds the dashboard on first run, and stops everything if any one process dies. The same pieces by hand, one terminal each:
 ```bash
-psql postgresql://postgres:dev@localhost:5433/triagerag -f scripts/schema.sql   # idempotent
 (cd frontend && npm ci && npm run build)
+cd backend
+psql postgresql://postgres:dev@localhost:5433/triagerag -f scripts/schema.sql   # idempotent
 uv run uvicorn triagerag.service.app:app --port 8000
 uv run python -m triagerag.jobs.worker --types triage_ticket
 uv run python -m triagerag.jobs.worker --types index_ticket,index_batch,reindex_all,refresh_bm25,load_logs
@@ -595,9 +604,9 @@ Or all of it in Docker: `docker compose up --build` (api, worker-triage, worker-
 
 For dashboard development, run `npm run dev` in `frontend/` (Vite proxies the API to :8000).
 
-Tests: `uv run pytest`. Queue, pipeline, event and API tests run against a `triagerag_test` database on the compose Postgres (created automatically), and they skip when Postgres isn't running. They use a stub LLM, so no quota is spent.
+Tests: `make test` (or `uv run pytest` in `backend/`). Queue, pipeline, event and API tests run against a `triagerag_test` database on the compose Postgres (created automatically), and they skip when Postgres isn't running. They use a stub LLM, so no quota is spent.
 
-Run the agent:
+Run the agent (from `backend/`):
 ```bash
 uv run python scripts/run_agent.py HDFS-11445 --extra-calls 0   # one ticket, with trace
 uv run python scripts/eval_agent.py --extra-calls 0             # 12 dev tickets

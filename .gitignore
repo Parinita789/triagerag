@@ -1,4 +1,4 @@
-/data
+/backend/data
 .env
 
 # Python bytecode cache
