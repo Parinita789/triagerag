@@ -1,7 +1,8 @@
 import { Fragment } from "react";
 import { JobDetail, StepEvent } from "./api";
 
-type Ranked = { key: string; rank: number; score?: number; dense_rank?: number | null; bm25_rank?: number | null };
+type Ranked = { key: string; rank: number; score?: number; dense_rank?: number | null; bm25_rank?: number | null; hybrid_rank?: number | null; sent_to_llm?: boolean };
+type Rerank = { used: boolean; why: string; ranking: Ranked[] } | { skipped: string };
 type Llm = { reply: string; tool_calls: { name: string; arguments: string }[]; finish_reason: string; cache_hit: boolean | null };
 
 const PSEUDONYM = /(<[A-Z_]+_[0-9a-f]{8}>)/;  // not /g: .test() on a /g regex keeps state
@@ -17,20 +18,23 @@ export function Redacted({ text }: { text: string }) {
   );
 }
 
-const first = (events: StepEvent[], step: string) => events.find((e) => e.step === step);
+const first = (events: StepEvent[], step: string) => events.find((e) => e.step === step && e.status !== "running");
 
-export default function TriageInspector({ job }: { job: JobDetail }) {
-  const ev = job.events;
-  const redact = first(ev, "redact")?.output as { summary: string; description: string; counts: Record<string, number> } | undefined;
-  const dense = (first(ev, "retrieve.dense")?.output ?? []) as Ranked[];
-  const bm25 = (first(ev, "retrieve.bm25")?.output ?? []) as Ranked[];
-  const fused = (first(ev, "rrf")?.output ?? []) as Ranked[];
-  const llmEvents = ev.filter((e) => e.step === "llm");
+export default function TriageInspector({ job, attempt }: { job: JobDetail; attempt: number }) {
+  const ev = job.events.filter((e) => e.attempt === attempt);
+  const redact = first(ev, "redact")?.output as { summary: string; text: string; counts: Record<string, number> } | undefined;
+  const extracted = first(ev, "extract")?.output as { template_ids: number[]; exceptions: string[]; log_lines: { message: string; template_id: number | null }[] } | undefined;
+  const dense = (first(ev, "dense")?.output ?? []) as Ranked[];
+  const bm25 = (first(ev, "bm25")?.output ?? []) as Ranked[];
+  const fused = (first(ev, "hybrid")?.output ?? []) as Ranked[];
+  const rr = first(ev, "rerank")?.output as Rerank | undefined;
+  const reranked = rr && "ranking" in rr ? rr.ranking : [];
+  const llmEvents = ev.filter((e) => e.step === "llm" && e.status !== "running");
   const validate = first(ev, "validate")?.output as { kept: string[]; dropped: string[]; errors: string[] } | undefined;
   const comment = (first(ev, "comment")?.output as { comment: string } | undefined)?.comment ?? job.triage?.comment;
 
-  const rows = Math.max(dense.length, bm25.length, fused.length);
-  const fusedKeys = new Set(fused.map((f) => f.key));
+  const rows = Math.max(Math.min(dense.length, 10), Math.min(bm25.length, 10), fused.length, reranked.length);
+  const fusedKeys = new Set(fused.filter((f) => f.sent_to_llm).map((f) => f.key));
 
   return (
     <div className="inspector">
@@ -47,16 +51,29 @@ export default function TriageInspector({ job }: { job: JobDetail }) {
             </span>
           </h4>
           <p><strong><Redacted text={redact.summary} /></strong></p>
-          <pre className="prose"><Redacted text={redact.description} /></pre>
+          <pre className="prose"><Redacted text={redact.text} /></pre>
+          {extracted && (
+            <p className="small">
+              <span className="muted">Extracted: </span>
+              {extracted.log_lines.length} log lines · templates{" "}
+              {extracted.template_ids.length ? extracted.template_ids.map((t) => <span key={t} className="chip">T{t}</span>) : <span className="muted">none</span>}{" "}
+              · exceptions{" "}
+              {extracted.exceptions.length ? extracted.exceptions.map((x) => <span key={x} className="chip">{x}</span>) : <span className="muted">none</span>}
+            </p>
+          )}
         </div>
       )}
 
       {rows > 0 && (
         <div className="panel">
-          <h4>Retrieval: dense, BM25 and fused (RRF) side by side</h4>
+          <h4>Retrieval: dense, BM25, hybrid and rerank side by side</h4>
+          <p className="muted small">
+            Highlighted tickets made the hybrid top 5, which is what the LLM sees.
+            {rr && " " + ("skipped" in rr ? `Rerank skipped: ${rr.skipped}.` : `Rerank is shown only: ${rr.why}.`)}
+          </p>
           <table className="ranks">
             <thead>
-              <tr><th>#</th><th>Dense</th><th>BM25</th><th>RRF (dense rank / BM25 rank)</th></tr>
+              <tr><th>#</th><th>Dense (cosine)</th><th>BM25</th><th>Hybrid (dense / BM25 rank)</th><th>Rerank (hybrid rank)</th></tr>
             </thead>
             <tbody>
               {Array.from({ length: rows }, (_, i) => (
@@ -64,11 +81,18 @@ export default function TriageInspector({ job }: { job: JobDetail }) {
                   <td className="muted">{i + 1}</td>
                   <RankCell hit={dense[i]} hl={fusedKeys} />
                   <RankCell hit={bm25[i]} hl={fusedKeys} />
-                  <td>
+                  <td className={fused[i]?.sent_to_llm ? "in-fused" : ""}>
                     {fused[i] && (
                       <>
                         <strong>{fused[i].key}</strong>{" "}
                         <span className="muted small">{fused[i].dense_rank ?? "–"} / {fused[i].bm25_rank ?? "–"}</span>
+                      </>
+                    )}
+                  </td>
+                  <td>
+                    {reranked[i] && (
+                      <>
+                        {reranked[i].key} <span className="muted small">({reranked[i].hybrid_rank ?? "–"}) {reranked[i].score?.toFixed(2)}</span>
                       </>
                     )}
                   </td>

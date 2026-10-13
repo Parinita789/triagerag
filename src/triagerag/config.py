@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     jira_webhook_secret: str = ""
     judge_model: str = ""
     loki_url: str = "http://localhost:3100"
+    preview_rerank: bool = True  # run the reranker in triage jobs for display (not used for ranking)
     api_key: str = ""  # X-API-Key for /jobs and /metrics; unset = those endpoints refuse every request
 
 

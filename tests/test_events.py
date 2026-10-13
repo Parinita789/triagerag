@@ -2,7 +2,7 @@ from conftest import StubLLM, make_issue
 
 from triagerag.jobs import events, queue
 from triagerag.jobs.worker import Resources, work
-from triagerag.pipeline import index
+from triagerag.pipeline import index, triage
 
 SECRET = "AKIA1234567890ABCDEF"
 
@@ -34,9 +34,35 @@ def test_triage_events_in_order_and_redacted(db):
     rows = db.execute("select seq, step, status, input::text, output::text from job_events "
                       "where job_id = %s order by seq", (job_id,)).fetchall()
     steps = [r[1] for r in rows]
-    assert 8 <= len(rows) <= 12, steps
     assert [r[0] for r in rows] == list(range(1, len(rows) + 1))
-    assert steps[0] == "redact" and steps[-1] == "comment"
-    assert {"retrieve.dense", "retrieve.bm25", "rrf", "llm", "tool", "validate"} <= set(steps)
+    assert all(r[2] == "ok" for r in rows), rows  # nothing left 'running'
+    # the lifecycle, in order (tool calls interleave but aren't stages)
+    stages = [s for s in steps if s in triage.STAGES]
+    assert stages == list(triage.STAGES), steps
     assert not any(SECRET in (r[3] or "") or SECRET in (r[4] or "") for r in rows)
-    assert '"AWS_KEY": 1' in rows[0][4]
+    redact_row = rows[steps.index("redact")]
+    assert '"AWS_KEY": 1' in redact_row[4]
+
+
+def test_step_is_running_until_it_ends(db):
+    job_id = queue.enqueue(db, "refresh_bm25", {})
+    token = events.current_job.set(job_id)
+    try:
+        with events.step("slow", {"n": 1}) as st:
+            assert db.execute("select status, ms from job_events where job_id = %s",
+                              (job_id,)).fetchone() == ("running", None)
+            st.progress({"done": 1})
+            st.output = {"done": 2}
+        status, ms, output = db.execute(
+            "select status, ms, output from job_events where job_id = %s", (job_id,)).fetchone()
+        assert status == "ok" and ms is not None and output == {"done": 2}
+
+        try:
+            with events.step("boom"):
+                raise ValueError("nope")
+        except ValueError:
+            pass
+        assert db.execute("select status, output->>'error' from job_events where step = 'boom'"
+                          ).fetchone() == ("error", "ValueError: nope")
+    finally:
+        events.current_job.reset(token)

@@ -13,6 +13,7 @@ from pathlib import Path
 import httpx
 
 from triagerag.config import settings
+from triagerag.jobs.events import step
 from triagerag.jobs.registry import job
 
 BATCH = 5_000
@@ -105,9 +106,15 @@ def load(path: Path | None = None, limit: int = 0, url: str | None = None,
             "push_errors": len(errors), "first_errors": errors[:3]}
 
 
-@job("load_logs", max_attempts=1)  # not idempotent: a retry would duplicate the lines already pushed
+# not idempotent: a retry would duplicate the lines already pushed
+@job("load_logs", max_attempts=1, stages=("push",))
 def load_logs(ctx, payload: dict) -> dict:
     path = Path(payload["path"]) if payload.get("path") else None
-    result = load(path, limit=int(payload.get("limit") or 0), on_batch=lambda _n: ctx.heartbeat())
+    with step("push", {"path": str(path or find_log()), "batch": BATCH}) as st:
+        def on_batch(n: int) -> None:
+            ctx.heartbeat()
+            st.progress({"lines_read": n})
+        result = load(path, limit=int(payload.get("limit") or 0), on_batch=on_batch)
+        st.output = {k: v for k, v in result.items() if k != "streams"}
     result.pop("streams")
     return result

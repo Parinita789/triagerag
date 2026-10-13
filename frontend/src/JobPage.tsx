@@ -1,16 +1,19 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Api, JobDetail, StepEvent, age } from "./api";
+import Lifecycle, { fmtMs, lifecycle } from "./Lifecycle";
 import TriageInspector from "./TriageInspector";
 
 export default function JobPage({ api, id }: { api: Api; id: number }) {
   const [job, setJob] = useState<JobDetail | null>(null);
-  const [selected, setSelected] = useState<number | null>(null);
+  const [attempt, setAttempt] = useState<number | null>(null); // null: follow the current attempt
+  const [picked, setPicked] = useState<string | null>(null); // null: follow the running step
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(() => api.job(id).then(setJob, (e) => setError(String(e))), [api, id]);
   useEffect(() => {
     setJob(null);
-    setSelected(null);
+    setPicked(null);
+    setAttempt(null);
     load();
   }, [load]);
 
@@ -18,9 +21,16 @@ export default function JobPage({ api, id }: { api: Api; id: number }) {
   useEffect(() => {
     if (!live) return;
     return api.stream(id, {
+      // a step arrives when it starts and again when it ends: replace it by seq
       step: (ev) =>
-        setJob((j) => (j && !j.events.some((e) => e.seq === ev.seq) ? { ...j, events: [...j.events, ev] } : j)),
-      status: (s) => setJob((j) => (j ? { ...j, ...s, children: j.children, events: j.events, triage: j.triage } : j)),
+        setJob((j) => {
+          if (!j) return j;
+          const events = j.events.filter((e) => e.seq !== ev.seq);
+          events.push(ev);
+          events.sort((a, b) => a.seq - b.seq);
+          return { ...j, events };
+        }),
+      status: (s) => setJob((j) => (j ? { ...j, ...s, stages: j.stages, children: j.children, events: j.events, triage: j.triage } : j)),
       end: load,
     });
   }, [api, id, live, load]);
@@ -33,9 +43,17 @@ export default function JobPage({ api, id }: { api: Api; id: number }) {
     return () => clearInterval(t);
   }, [childrenOpen, load]);
 
+  const shownAttempt = attempt ?? Math.max(job?.attempts ?? 1, 1);
+  const nodes = useMemo(() => (job ? lifecycle(job, shownAttempt) : []), [job, shownAttempt]);
+
   if (error) return <p className="error">{error}</p>;
   if (!job) return <p className="muted">Loading…</p>;
-  const step = job.events.find((e) => e.seq === selected);
+
+  const running = nodes.find((n) => n.status === "running" && n.event);
+  const lastDone = [...nodes].reverse().find((n) => n.event);
+  const selectedKey = picked ?? running?.key ?? (job.status === "failed" ? "end" : lastDone?.key ?? null);
+  const selected = nodes.find((n) => n.key === selectedKey);
+  const extra = job.events.filter((e) => e.attempt === shownAttempt && !job.stages.includes(e.step));
 
   return (
     <section>
@@ -44,52 +62,58 @@ export default function JobPage({ api, id }: { api: Api; id: number }) {
           <a href="#/" className="muted">Queue</a> / {job.type} #{job.id}
         </h2>
         <span className={`pill ${job.status}`}>{job.status}</span>
-        {job.status === "failed" && (
-          <button onClick={() => api.retry(job.id).then(load)}>Retry</button>
-        )}
+        {live && <span className="live">live</span>}
+        {job.status === "failed" && <button onClick={() => api.retry(job.id).then(load)}>Retry</button>}
       </div>
 
       <dl className="facts">
-        <div><dt>Attempts</dt><dd>{job.attempts}/{job.max_attempts}</dd></div>
         <div><dt>Created</dt><dd>{age(job.created_at)} ago</dd></div>
         <div><dt>Duration</dt><dd>{duration(job.started_at, job.finished_at)}</dd></div>
-        {job.dedupe_key && <div><dt>Dedupe key</dt><dd>{job.dedupe_key}</dd></div>}
+        <div><dt>Attempts</dt><dd>{job.attempts}/{job.max_attempts}</dd></div>
+        {(job.payload.key as string) && <div><dt>Ticket</dt><dd>{job.payload.key as string}</dd></div>}
         {job.parent_id && <div><dt>Parent</dt><dd><a href={`#/jobs/${job.parent_id}`}>#{job.parent_id}</a></dd></div>}
       </dl>
 
-      {job.error && (
-        <details className="error-box" open={job.status === "failed"}>
-          <summary>Last error (attempt {job.attempts})</summary>
-          <pre>{job.error}</pre>
-        </details>
+      {job.attempts > 1 && (
+        <div className="tabs">
+          {Array.from({ length: job.attempts }, (_, i) => i + 1).map((a) => (
+            <button key={a} className={a === shownAttempt ? "tab active" : "tab"} onClick={() => (setAttempt(a), setPicked(null))}>
+              Attempt {a}
+            </button>
+          ))}
+        </div>
       )}
+
+      <h3>Lifecycle</h3>
+      <Lifecycle nodes={nodes} selected={selectedKey} onSelect={setPicked} />
+
+      {selected?.event && <StepDetail step={selected.event} info={selected.info} />}
+      {selected?.key === "end" && <EndDetail job={job} current={shownAttempt === Math.max(job.attempts, 1)} />}
 
       {job.children.total > 0 && <Progress children={job.children} />}
 
-      <h3>Steps {live && <span className="live">live</span>}</h3>
-      {job.events.length === 0 ? (
-        <p className="muted">{live ? "Waiting for the first step…" : "This job recorded no steps."}</p>
-      ) : (
-        <Waterfall events={job.events} selected={selected} onSelect={setSelected} />
-      )}
-      {step && <StepDetail step={step} />}
-
-      {job.type === "triage_ticket" && job.events.length > 0 && <TriageInspector job={job} />}
-
-      {job.result && (
-        <details>
-          <summary>Result</summary>
-          <pre>{JSON.stringify(job.result, null, 2)}</pre>
+      {extra.length > 0 && (
+        <details className="extra">
+          <summary>Other events in this attempt ({extra.length}): tool calls, index sync</summary>
+          {extra.map((e) => (
+            <details key={e.seq} className="extra-row">
+              <summary>
+                #{e.seq} <code>{e.step}</code> <span className="muted small">{e.status} {fmtMs(e.ms)}</span>
+              </summary>
+              <IO step={e} />
+            </details>
+          ))}
         </details>
       )}
+
+      {job.type === "triage_ticket" && job.events.length > 0 && <TriageInspector job={job} attempt={shownAttempt} />}
     </section>
   );
 }
 
 function duration(start: string | null, end: string | null): string {
   if (!start) return "–";
-  const ms = (end ? new Date(end).getTime() : Date.now()) - new Date(start).getTime();
-  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
+  return fmtMs((end ? new Date(end).getTime() : Date.now()) - new Date(start).getTime());
 }
 
 function Progress({ children }: { children: JobDetail["children"] }) {
@@ -112,52 +136,54 @@ function Progress({ children }: { children: JobDetail["children"] }) {
   );
 }
 
-function Waterfall({ events, selected, onSelect }: { events: StepEvent[]; selected: number | null; onSelect: (s: number) => void }) {
-  const spans = events.map((e) => {
-    const end = new Date(e.created_at).getTime();
-    return { e, start: end - (e.ms ?? 0), end };
-  });
-  const t0 = Math.min(...spans.map((s) => s.start));
-  const total = Math.max(1, Math.max(...spans.map((s) => s.end)) - t0);
+function StepDetail({ step, info }: { step: StepEvent; info?: string }) {
+  const what = (step.output as { what?: string } | null)?.what;
   return (
-    <div className="waterfall">
-      {spans.map(({ e, start, end }) => (
-        <button key={e.seq} className={`wf-row ${selected === e.seq ? "selected" : ""}`} onClick={() => onSelect(e.seq)}>
-          <span className="wf-name">
-            <span className={`dot ${e.status === "error" ? "failed" : "done"}`} /> {e.step}
-          </span>
-          <span className="wf-track">
-            <span
-              className={`wf-bar ${e.status}`}
-              style={{ left: `${(100 * (start - t0)) / total}%`, width: `max(3px, ${(100 * (end - start)) / total}%)` }}
-            />
-          </span>
-          <span className="wf-ms">
-            {e.ms != null ? `${e.ms} ms` : ""}
-            {e.tokens ? ` · ${e.tokens} tok` : ""}
-          </span>
-        </button>
-      ))}
+    <div className="step-detail">
+      <h4>
+        {step.step} <span className={`pill ${step.status === "error" ? "failed" : step.status === "running" ? "running" : "done"}`}>{step.status}</span>
+        <span className="muted small"> {fmtMs(step.ms)}{step.tokens ? ` · ${step.tokens} tokens` : ""}</span>
+      </h4>
+      {(what || info) && <p className="muted">{what ?? info}</p>}
+      <IO step={step} />
     </div>
   );
 }
 
-function StepDetail({ step }: { step: StepEvent }) {
+function IO({ step }: { step: StepEvent }) {
+  const strip = (v: unknown) => {
+    if (v && typeof v === "object" && !Array.isArray(v) && "what" in v) {
+      const { what: _, ...rest } = v as Record<string, unknown>;
+      return rest;
+    }
+    return v;
+  };
+  return (
+    <div className="two-col">
+      <div>
+        <h5>Input</h5>
+        <pre>{step.input == null ? "–" : JSON.stringify(step.input, null, 2)}</pre>
+      </div>
+      <div>
+        <h5>Output</h5>
+        <pre>{step.status === "running" && step.output == null ? "running…" : step.output == null ? "–" : JSON.stringify(strip(step.output), null, 2)}</pre>
+      </div>
+    </div>
+  );
+}
+
+function EndDetail({ job, current }: { job: JobDetail; current: boolean }) {
+  if (current && job.status === "done")
+    return (
+      <div className="step-detail">
+        <h4>Result</h4>
+        <pre>{JSON.stringify(job.result, null, 2)}</pre>
+      </div>
+    );
   return (
     <div className="step-detail">
-      <h4>
-        #{step.seq} {step.step} <span className={`pill ${step.status === "error" ? "failed" : "done"}`}>{step.status}</span>
-      </h4>
-      <div className="two-col">
-        <div>
-          <h5>Input</h5>
-          <pre>{step.input == null ? "–" : JSON.stringify(step.input, null, 2)}</pre>
-        </div>
-        <div>
-          <h5>Output</h5>
-          <pre>{step.output == null ? "–" : JSON.stringify(step.output, null, 2)}</pre>
-        </div>
-      </div>
+      <h4 className="error">{current ? "Error" : "This attempt failed"}</h4>
+      <pre>{job.error ?? "The error of an earlier attempt is replaced by the latest one."}</pre>
     </div>
   );
 }

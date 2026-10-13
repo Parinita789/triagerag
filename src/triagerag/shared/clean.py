@@ -83,45 +83,62 @@ def split_blocks(text: str) -> tuple[str, list[str]]:
     return prose, [b for b in blocks if b.strip()]
 
 
-def clean_text(raw: str | None) -> tuple[CleanText, Counter[str]]:
-    counts: Counter[str] = Counter()
+def structure_text(raw: str | None) -> CleanText:
+    """Split code blocks from prose and strip Jira markup. No redaction yet."""
     if not raw:
-        return CleanText(prose=""), counts
-
+        return CleanText(prose="")
     raw = raw.replace("\u00a0", " ")
     prose, blocks = split_blocks(raw)
-    prose = strip_markup(prose)
-
-    prose, c = redact(prose)
-    counts.update(c)
-    redacted_blocks = []
-    for block in blocks:
-        block, c = redact(_normalize_whitespace(block))
-        counts.update(c)
-        redacted_blocks.append(block)
-
-    return CleanText(prose=prose, blocks=redacted_blocks), counts
+    return CleanText(prose=strip_markup(prose), blocks=[_normalize_whitespace(b) for b in blocks])
 
 
-def clean_ticket(issue: dict[str, Any]) -> CleanTicket:
-    f = issue["fields"]
+def redact_clean_text(text: CleanText) -> tuple[CleanText, Counter[str]]:
     counts: Counter[str] = Counter()
-
-    summary, c = redact(f["summary"])
+    prose, c = redact(text.prose)
     counts.update(c)
+    blocks = []
+    for block in text.blocks:
+        block, c = redact(block)
+        counts.update(c)
+        blocks.append(block)
+    return CleanText(prose=prose, blocks=blocks), counts
 
-    description, c = clean_text(f.get("description"))
-    counts.update(c)
 
+def clean_text(raw: str | None) -> tuple[CleanText, Counter[str]]:
+    return redact_clean_text(structure_text(raw))
+
+
+def structure_ticket(issue: dict[str, Any]) -> CleanTicket:
+    """Clean step: markup stripped, code blocks split, bot comments dropped. Not redacted yet:
+    always follow with redact_ticket before storing or showing anything."""
+    f = issue["fields"]
     comments: list[CleanComment] = []
     dropped = 0
     for cm in (f.get("comment") or {}).get("comments", []):
         if cm["author"]["name"] in BOTS:
             dropped += 1
             continue
-        text, c = clean_text(cm.get("body"))
-        counts.update(c)
+        text = structure_text(cm.get("body"))
         if text.prose or text.blocks:
             comments.append(CleanComment(cm["author"]["name"], cm["created"], text))
+    return CleanTicket(issue["key"], f["summary"], f["created"], structure_text(f.get("description")),
+                       comments, Counter(), dropped)
 
-    return CleanTicket(issue["key"], summary, f["created"], description, comments, counts, dropped)
+
+def redact_ticket(t: CleanTicket) -> CleanTicket:
+    """Redact step: secrets and PII replaced with pseudonyms; counts per detector, never values."""
+    counts: Counter[str] = Counter()
+    summary, c = redact(t.summary)
+    counts.update(c)
+    description, c = redact_clean_text(t.description)
+    counts.update(c)
+    comments = []
+    for cm in t.comments:
+        text, c = redact_clean_text(cm.text)
+        counts.update(c)
+        comments.append(CleanComment(cm.author, cm.created, text))
+    return CleanTicket(t.key, summary, t.created, description, comments, counts, t.bot_comments_dropped)
+
+
+def clean_ticket(issue: dict[str, Any]) -> CleanTicket:
+    return redact_ticket(structure_ticket(issue))

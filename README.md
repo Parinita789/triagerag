@@ -199,7 +199,16 @@ you              │ GET /jobs/{id}/stream (SSE)  POST /jobs/{id}/retry │
 - **Dedupe:** at most one *active* job per `dedupe_key`. Fifty resolved tickets cause a handful of BM25 refreshes, not fifty.
 - **The BM25 problem.** The BM25 index lives in each triage worker's memory, so an index worker can't update it. `refresh_bm25` bumps `index_state.bm25_version`; before each triage, a worker compares it with its own version and rebuilds if it's behind. New tickets are searchable seconds after their resolved webhook, with no manual re-index.
 - **Idempotent indexing:** a ticket's old chunks are deleted and the new ones inserted in one transaction, so indexing twice never duplicates.
-- **Step events.** The worker puts the job id in a `ContextVar`; pipeline code calls `record_step(...)` without passing ids around (and it's a no-op in CLI scripts and evals). One triage records ~9 events: `redact`, `retrieve.dense`, `retrieve.bm25`, `rrf`, `tool`, `llm`, `validate`, `tool`, `comment`. Each input/output is redacted again and capped at 8 KB. A test sends a fake AWS key and checks that no event contains it.
+- **One job, a visible lifecycle.** Each job type declares its steps (`@job("triage_ticket", stages=...)`). A step is written as `running` when it starts and updated to `ok` / `error` / `skipped` with its duration and output when it ends, so the dashboard shows which step a job is in right now. The worker puts the job id and attempt in `ContextVar`s, so pipeline code records steps without passing ids around (outside a job, in CLI scripts and evals, it's a no-op). Every input/output is redacted again and capped at 8 KB; a test sends a fake AWS key and checks it appears in no step.
+
+  | Job | Lifecycle |
+  |---|---|
+  | `triage_ticket` | clean → redact → extract → embed → dense → bm25 → hybrid → rerank → llm → validate → comment |
+  | `index_ticket` | fetch → load → clean → redact → chunk → embed → store → refresh_bm25 |
+  | `index_batch` | load → clean → redact → chunk → embed → store → refresh_bm25 |
+  | `reindex_all` | select → fan_out |
+
+  The triage query is built exactly like the eval queries (cleaned, redacted, ticket keys removed), so the live pipeline is the one that was measured. **Rerank** runs the cross-encoder and shows how it would reorder the hybrid results, but the LLM still gets the hybrid order: Phase 5 measured the reranker making retrieval worse. Set `PREVIEW_RERANK=false` to skip it (the triage worker then doesn't load the ~1 GB model).
 - **Live updates over SSE.** `GET /jobs/{id}/stream` polls `job_events` every 500 ms and closes when the job ends. That's simpler than WebSockets and enough for one-way updates.
 - **Graceful degradation:** when the LLM is down or over budget, the comment still lists the 5 related tickets, since retrieval needs no LLM. A daily-limit 429 fails immediately instead of retrying.
 - **Graceful shutdown:** SIGTERM lets the current job finish. Heavy resources (embedder, `SearchService`) load once per process, and only in workers whose jobs use them.
@@ -208,8 +217,8 @@ you              │ GET /jobs/{id}/stream (SSE)  POST /jobs/{id}/retry │
 
 **Dashboard** (`frontend/`, React + Vite + TypeScript, served at `/ui`):
 - **Queue board:** queued / running / done / failed columns with live counts, attempts, age, last error, and a retry button.
-- **Job timeline:** a waterfall of steps with durations; click a step to see its input and output; error history; a fan-out progress bar.
-- **Triage inspector:** ticket text with redactions highlighted; dense, BM25 and RRF ranks side by side; the LLM prompt and reply; citations kept and dropped; the comment.
+- **Job lifecycle:** queued → attempt → every step → done/failed, live; the running step spins; click any step for what it did (input and output); one tab per retry attempt; a fan-out progress bar. Board cards show the same lifecycle as a segmented bar with the current step.
+- **Triage inspector:** ticket text with redactions highlighted and extracted exceptions/templates; dense, BM25, hybrid and rerank rankings side by side; the LLM prompt and reply; citations kept and dropped; the comment.
 - **Try it:** paste a ticket and watch every step arrive live.
 
 <!-- demo GIF: docs/try-it.gif -->

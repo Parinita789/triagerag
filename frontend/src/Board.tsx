@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
-import { Api, ApiError, Job, Metrics, Status, age } from "./api";
+import { Api, ApiError, Job, Metrics, Status, age, until } from "./api";
+import { MiniLifecycle } from "./Lifecycle";
 
 const COLUMNS: Status[] = ["queued", "running", "done", "failed"];
 const POLL_MS = 2000;
@@ -73,6 +74,10 @@ function JobCard({ job, api, onChange }: { job: Job; api: Api; onChange: () => v
         <span>attempt {job.attempts}/{job.max_attempts}</span>
         <span>{age(job.created_at)} ago</span>
       </div>
+      {job.stages && job.status !== "queued" && <MiniLifecycle stages={job.stages} steps={job.steps ?? {}} />}
+      {job.status === "queued" && new Date(job.run_after).getTime() > Date.now() && (
+        <div className="small muted">{job.attempts ? "retry" : "starts"} in {until(job.run_after)}</div>
+      )}
       {!!job.children && <div className="small muted">{job.children} child jobs</div>}
       {job.error && <div className="error small clip">{job.error.split("\n")[0]}</div>}
       {job.status === "failed" && (

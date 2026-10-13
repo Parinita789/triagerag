@@ -80,7 +80,7 @@ create table if not exists job_events (
   job_id      bigint not null references jobs(id) on delete cascade,
   seq         int not null,
   step        text not null,
-  status      text not null,
+  status      text not null,          -- running | ok | error | skipped
   ms          int,
   tokens      int,
   input       jsonb,
@@ -88,6 +88,11 @@ create table if not exists job_events (
   created_at  timestamptz not null default now()
 );
 create index if not exists job_events_job on job_events (job_id, seq);
+-- lifecycle: a step is written as 'running' when it starts and updated when it ends,
+-- so the dashboard can show which step a job is in right now
+alter table job_events add column if not exists attempt int not null default 1;
+alter table job_events add column if not exists updated_at timestamptz not null default clock_timestamp();
+create index if not exists job_events_updated on job_events (job_id, updated_at);
 
 -- Outcome: one row per Jira issue (also the once-per-issue webhook check). jobs handles execution.
 create table if not exists triages (

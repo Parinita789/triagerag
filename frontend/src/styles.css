@@ -124,3 +124,41 @@ main { padding: 20px 24px 60px; max-width: 1400px; margin: 0 auto; }
 .chip.ok { background: color-mix(in srgb, var(--done) 18%, transparent); }
 .chip.bad { background: color-mix(in srgb, var(--failed) 18%, transparent); text-decoration: line-through; }
 details summary { cursor: pointer; }
+
+/* lifecycle: one node per step, connected left to right, wrapping on narrow screens */
+.lifecycle { list-style: none; margin: 0 0 12px; padding: 12px; display: flex; flex-wrap: wrap; gap: 14px 0; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; }
+.lc-node { display: flex; align-items: flex-start; }
+.lc-edge { width: 18px; height: 2px; background: var(--border); margin-top: 13px; flex: none; }
+.lc-edge.reached { background: var(--done); }
+.lc-node.running .lc-edge { background: var(--running); }
+.lc-node button { display: grid; justify-items: center; gap: 2px; width: 104px; padding: 2px 4px 4px; background: transparent; color: var(--text); border-radius: 6px; text-align: center; }
+.lc-node button:disabled { cursor: default; }
+.lc-node button:not(:disabled):hover, .lc-node.selected button { background: var(--bg); }
+.lc-dot { width: 26px; height: 26px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; font-weight: 700; color: #fff; background: transparent; border: 2px solid var(--border); }
+.lc-node.ok .lc-dot { background: var(--done); border-color: var(--done); }
+.lc-node.error .lc-dot { background: var(--failed); border-color: var(--failed); }
+.lc-node.skipped .lc-dot { background: var(--queued); border-color: var(--queued); }
+.lc-node.running .lc-dot { border-color: var(--running); border-top-color: transparent; animation: spin .9s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.lc-label { font-family: var(--mono); font-size: 12px; font-weight: 600; }
+.lc-node.pending .lc-label { color: var(--muted); font-weight: 400; }
+.lc-runs { color: var(--muted); font-weight: 400; margin-left: 3px; }
+.lc-ms { font-size: 11px; color: var(--muted); min-height: 14px; }
+.lc-node.running .lc-ms { color: var(--running); }
+.lc-info { font-size: 11px; line-height: 1.3; color: var(--muted); }
+@media (max-width: 560px) { .lc-node button { width: 84px; } .lc-info { display: none; } }
+
+.mini { margin-top: 6px; }
+.mini-bar { display: flex; gap: 2px; margin-bottom: 2px; }
+.mini-seg { flex: 1; height: 5px; border-radius: 2px; background: var(--border); }
+.mini-seg.ok { background: var(--done); }
+.mini-seg.skipped { background: var(--queued); }
+.mini-seg.error { background: var(--failed); }
+.mini-seg.running { background: var(--running); animation: pulse 1s infinite; }
+
+.tabs { display: flex; gap: 4px; margin: 8px 0; }
+.tab { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+.tab.active { background: var(--surface); color: var(--text); border-color: var(--accent); }
+.extra { margin: 12px 0; }
+.extra-row { margin: 4px 0 4px 12px; }
+.chip { background: var(--bg); border: 1px solid var(--border); }

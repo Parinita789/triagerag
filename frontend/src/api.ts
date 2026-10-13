@@ -1,14 +1,19 @@
 export type Status = "queued" | "running" | "done" | "failed";
 
+export type StepStatus = "running" | "ok" | "error" | "skipped";
+
 export interface StepEvent {
+  id: number;
+  attempt: number;
   seq: number;
   step: string;
-  status: "ok" | "error";
+  status: StepStatus;
   ms: number | null;
   tokens: number | null;
   input: unknown;
   output: unknown;
   created_at: string;
+  updated_at: string;
 }
 
 export interface Job {
@@ -28,6 +33,8 @@ export interface Job {
   finished_at: string | null;
   heartbeat_at: string | null;
   children?: number;
+  stages?: string[];
+  steps?: Record<string, StepStatus>;
 }
 
 export interface Triage {
@@ -38,7 +45,8 @@ export interface Triage {
   result: Record<string, unknown> | null;
 }
 
-export interface JobDetail extends Omit<Job, "children"> {
+export interface JobDetail extends Omit<Job, "children" | "stages"> {
+  stages: string[];
   events: StepEvent[];
   children: { total: number } & Partial<Record<Status, number>>;
   triage: Triage | null;
@@ -102,7 +110,16 @@ export class Api {
 
 export function age(iso: string | null): string {
   if (!iso) return "–";
-  const s = Math.max(0, (Date.now() - new Date(iso).getTime()) / 1000);
+  return span((Date.now() - new Date(iso).getTime()) / 1000);
+}
+
+/** Time from now until iso, e.g. a retry's run_after. */
+export function until(iso: string): string {
+  return span((new Date(iso).getTime() - Date.now()) / 1000);
+}
+
+function span(seconds: number): string {
+  const s = Math.max(0, seconds);
   if (s < 60) return `${Math.round(s)}s`;
   if (s < 3600) return `${Math.round(s / 60)}m`;
   if (s < 86400) return `${Math.round(s / 3600)}h`;

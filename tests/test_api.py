@@ -4,7 +4,7 @@ from fastapi.testclient import TestClient
 
 from triagerag.jobs import queue
 from triagerag.jobs.worker import Resources, work
-from triagerag.pipeline import index
+from triagerag.pipeline import index, triage
 from triagerag.service import app as service
 
 KEY = "test-api-key"
@@ -59,9 +59,12 @@ def test_stream_sends_steps_and_ends(client, db):
 
     with client.stream("GET", f"/jobs/{job_id}/stream?key={KEY}") as r:
         body = "".join(r.iter_text())
-    assert body.count("event: step") >= 8
+    assert body.count("event: step") >= len(triage.STAGES)
     assert "event: end" in body and '"status": "done"' in body
 
     detail = client.get(f"/jobs/{job_id}", headers=H).json()
+    assert detail["stages"] == list(triage.STAGES)
+    listed = client.get("/jobs", headers=H).json()[0]
+    assert listed["steps"]["llm"] == "ok" and listed["steps"]["rerank"] == "ok"
     assert detail["triage"]["issue_key"] == f"TRY-{job_id}"
     assert [e["seq"] for e in detail["events"]] == list(range(1, len(detail["events"]) + 1))

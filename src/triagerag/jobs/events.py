@@ -1,8 +1,10 @@
-"""Step events: what each step of a running job did, for the dashboard.
+"""Step events: the lifecycle of a running job, step by step, for the dashboard.
 
-The worker sets `current_job` before calling a handler, so pipeline code calls record_step()
-without passing job ids around. Outside a job (CLI scripts, evals) record_step does nothing.
-Every string is redacted and each input/output is capped at about 8 KB."""
+The worker sets `current_job` / `current_attempt` before calling a handler, so pipeline code
+records steps without passing ids around. Outside a job (CLI scripts, evals) every call here
+does nothing. A step is written as 'running' when it starts and updated when it ends, so the
+dashboard shows which step a job is in right now. Every string is redacted and each
+input/output is capped at about 8 KB."""
 import json
 import time
 from collections.abc import Iterator
@@ -17,6 +19,7 @@ from triagerag.config import settings
 from triagerag.shared.redact import redact
 
 current_job: ContextVar[int | None] = ContextVar("current_job", default=None)
+current_attempt: ContextVar[int] = ContextVar("current_attempt", default=1)
 
 MAX_BYTES = 8_000
 _conns: dict[str, psycopg.Connection] = {}
@@ -66,37 +69,78 @@ def cap(value: Any, max_bytes: int = MAX_BYTES) -> Any:
     return value
 
 
-def record_step(step: str, input: Any = None, output: Any = None, ms: int | None = None,
-                tokens: int | None = None, status: str = "ok") -> None:
+def _json(value: Any) -> Jsonb | None:
+    return Jsonb(cap(value)) if value is not None else None
+
+
+def _insert(step: str, status: str, input: Any, output: Any, ms: int | None, tokens: int | None) -> int | None:
     job_id = current_job.get()
     if job_id is None:
-        return
+        return None
     try:
-        _conn().execute(
-            """insert into job_events (job_id, seq, step, status, ms, tokens, input, output)
-               select %(job)s, coalesce(max(seq), 0) + 1, %(step)s, %(status)s, %(ms)s, %(tokens)s,
-                      %(input)s, %(output)s
-               from job_events where job_id = %(job)s""",
-            {"job": job_id, "step": step, "status": status, "ms": ms, "tokens": tokens,
-             "input": Jsonb(cap(input)) if input is not None else None,
-             "output": Jsonb(cap(output)) if output is not None else None})
+        return _conn().execute(
+            """insert into job_events (job_id, attempt, seq, step, status, ms, tokens, input, output)
+               select %(job)s, %(attempt)s, coalesce(max(seq), 0) + 1, %(step)s, %(status)s, %(ms)s,
+                      %(tokens)s, %(input)s, %(output)s
+               from job_events where job_id = %(job)s
+               returning id""",
+            {"job": job_id, "attempt": current_attempt.get(), "step": step, "status": status,
+             "ms": ms, "tokens": tokens, "input": _json(input), "output": _json(output)}).fetchone()[0]
     except psycopg.Error as e:  # observability must never fail the job itself
-        print(f"record_step({step}) failed: {e}", flush=True)
+        print(f"step {step} not recorded: {e}", flush=True)
+        return None
+
+
+def _update(event_id: int | None, **fields: Any) -> None:
+    if event_id is None:
+        return
+    for key in ("input", "output"):
+        if key in fields:
+            fields[key] = _json(fields[key])
+    sets = ", ".join(f"{k} = %({k})s" for k in fields)
+    try:
+        _conn().execute(f"update job_events set {sets}, updated_at = clock_timestamp() where id = %(id)s",
+                        {**fields, "id": event_id})
+    except psycopg.Error as e:
+        print(f"step update not recorded: {e}", flush=True)
+
+
+def record_step(step: str, input: Any = None, output: Any = None, ms: int | None = None,
+                tokens: int | None = None, status: str = "ok") -> None:
+    """A step that's already finished (or instant)."""
+    _insert(step, status, input, output, ms, tokens)
+
+
+class Step:
+    """A step in progress. Set .output / .tokens / .status before it ends; progress() shows
+    partial output while it's still running (for long steps like pushing logs)."""
+
+    def __init__(self, name: str, input: Any) -> None:
+        self.name, self.input = name, input
+        self.output: Any = None
+        self.tokens: int | None = None
+        self.status = "ok"
+        self.start = time.perf_counter()
+        self.id = _insert(name, "running", input, None, None, None)
+
+    def progress(self, output: Any) -> None:
+        _update(self.id, output=output, ms=self.ms)
+
+    @property
+    def ms(self) -> int:
+        return int((time.perf_counter() - self.start) * 1000)
 
 
 @contextmanager
-def timed(step: str, input: Any = None) -> Iterator[dict[str, Any]]:
-    """Record a step with its duration. Set rec["output"] / rec["tokens"] / rec["status"] inside.
-    An exception records status=error, then propagates."""
-    rec: dict[str, Any] = {"input": input, "output": None, "tokens": None, "status": "ok"}
-    start = time.perf_counter()
+def step(name: str, input: Any = None) -> Iterator[Step]:
+    """Record a step: 'running' now, then ok / error / skipped with its duration when the block ends.
+    An exception marks it error and propagates."""
+    s = Step(name, input)
     try:
-        yield rec
+        yield s
     except Exception as e:
-        rec["status"] = "error"
-        rec["output"] = {"error": f"{type(e).__name__}: {e}"}
+        s.status = "error"
+        s.output = {**(s.output if isinstance(s.output, dict) else {}), "error": f"{type(e).__name__}: {e}"}
         raise
     finally:
-        if current_job.get() is not None:
-            record_step(step, rec["input"], rec["output"], int((time.perf_counter() - start) * 1000),
-                        rec["tokens"], rec["status"])
+        _update(s.id, status=s.status, output=s.output, ms=s.ms, tokens=s.tokens)
