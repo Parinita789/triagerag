@@ -31,6 +31,7 @@ def test_bot_comments_dropped() -> None:
         "fields": {
             "summary": "s",
             "description": "d",
+            "created": "2010-06-01T10:00:00.000+0000",
             "comment": {"comments": [
                 {"author": {"name": "hadoopqa"}, "created": "t", "body": "-1 overall"},
                 {"author": {"name": "szetszwo"}, "created": "t", "body": "Looks like a lease issue."},
